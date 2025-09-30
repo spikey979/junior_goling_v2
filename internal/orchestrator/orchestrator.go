@@ -73,6 +73,7 @@ type processReq struct {
     TextOnly   bool                   `json:"text_only"`
     FastUpload bool                   `json:"fast_upload"`
     Options    map[string]interface{} `json:"options"`
+    Source     string                 `json:"source"`
 }
 
 type processResp struct {
@@ -143,7 +144,10 @@ func (o *Orchestrator) handleProcess(w http.ResponseWriter, r *http.Request) {
             "user": user,
             "ai_engine": req.AIEngine,
             "text_only": req.TextOnly,
+            "idempotency_key": fmt.Sprintf("doc:%s:page:%d", jobID, p),
+            "attempt": 1,
         }
+        if req.Source != "" { payload["source"] = req.Source } else { payload["source"] = "api" }
         data, _ := json.Marshal(payload)
         if err := o.deps.Queue.EnqueueAI(r.Context(), data); err != nil {
             log.Error().Err(err).Msg("enqueue failed")
@@ -236,6 +240,8 @@ func (o *Orchestrator) handlePageDone(w http.ResponseWriter, r *http.Request) {
         }
         st.Status = "success"
         st.Progress = 100
+        // Cleanup stale temp files older than 1h as part of job completion hygiene
+        CleanupTemps(1 * time.Hour)
     }
     _ = o.deps.Status.Set(r.Context(), jobID, st)
     w.WriteHeader(http.StatusNoContent)

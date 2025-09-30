@@ -1,0 +1,32 @@
+# Go build and editor artifacts
+bin/
+build/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.log
+*.tmp
+
+# IDE/editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Coverage and profiling
+*.coverprofile
+coverage/
+profile.out
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs directory
+logs/
+

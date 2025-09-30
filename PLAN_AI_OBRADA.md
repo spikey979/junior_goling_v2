@@ -30,8 +30,8 @@ Ovaj dokument definira arhitekturu, pravila i korake implementacije servisa za o
 ## Tok podataka (happy path)
 1. Orchestrator procesuira dokument, odluči koje stranice idu na AI.
 2. Za svaku AI stranicu enqueuea job u `jobs:ai:pages` (Redis Stream) s referencom na sadržaj i preferencijom providerâ.
-3. Worker uzima job (XREADGROUP), rezervira RPM/TPM na primarnom provideru, poziva AI s `context.WithTimeout`.
-4. Rezultat sprema u storage, ažurira status (`job:{id}:status`), ACK‑a poruku (XACK).
+3. Worker uzima job (XREADGROUP), provjerava idempotency; rezervira RPM/TPM ili adaptivni limiter; poziva AI s `context.WithTimeout`.
+4. Rezultat sprema u storage, ažurira status (`job:{id}:status`), ACK‑a poruku (XACK). Na grešku requeue s backoffom (ZSET) ili DLQ nakon `N` pokušaja.
 
 ## Tok podataka (greške i failover)
 - Ako poziv na primarnom završi s 429/5xx/network/timeout → pokuša sekundarni provider (uz novu rezervaciju RPM/TPM i vlastiti timeout).
@@ -111,7 +111,14 @@ Ovaj dokument definira arhitekturu, pravila i korake implementacije servisa za o
 - Kod requeued jobova inkrementirati `attempt` i voditi `last_provider`.
 
 ## Metrike i logiranje
-- Metrike (Prometheus preporuka): queue depth, in‑flight, success/fail, retry rate, DLQ count, latencije, 4xx/5xx providera, iskorištenost RPM/TPM po `provider:model`.
+- Metrike (Prometheus):
+  - `aidispatcher_provider_requests_total{provider,model,result}` – success|rate_limited|transient|fatal
+  - `aidispatcher_provider_request_duration_seconds{provider,model}` – histogram
+  - `aidispatcher_pages_processed_total{result}` – success|dlq
+  - `aidispatcher_retries_total`
+  - `aidispatcher_breaker_events_total{provider,model,action}` – opened|closed
+  - `aidispatcher_queue_depth{type}` – stream|delayed|dlq
+  - (kasnije) in‑flight, tokens usage, RPM/TPM utilizacija
 - Logovi (strukturirani): `job_id`, `provider`, `model`, `attempt`, `tokens_used`, `latency_ms`, `error_class`, `failover=true/false`.
 
 ## Logiranje (lokalni file + rotacija + Axiom)
@@ -268,10 +275,11 @@ for msg := range stream.ConsumerGroup("jobs:ai:pages", "workers:images") {
 
 ## TODO (iterativno ćemo označavati)
 - [ ] Definirati finalni payload schema i mapu modela (logički → provider‑specifično)
-- [ ] Implementirati adaptivni limiter (concurrency + 429 cooldown)
-- [ ] Implementirati Redis Streams queue + delayed ZSET mover
+- [x] Implementirati adaptivni limiter (concurrency + 429 cooldown)
+- [x] Implementirati Redis Streams queue + delayed ZSET mover
 - [ ] Izvući AI klijente (OpenAI/Anthropic) i normalizirati usage
-- [ ] Worker loop: timeouti, multi‑model fallback, provider failover, retry/DLQ, idempotency
+- [x] Worker loop: multi‑model fallback proširen (fast‑model ruta; sekundarni model i na transient greške)
+- [ ] Worker loop: retry/DLQ i idempotency (ack-after-success)
 - [ ] Integrirati s orchestratorom (enqueue + rezultat agregacija)
 - [ ] Metrike (Prometheus) i strukturirano logiranje
 - [ ] Docker Compose targeti (monolit i micro varijante)
@@ -306,6 +314,19 @@ for msg := range stream.ConsumerGroup("jobs:ai:pages", "workers:images") {
 - [x] Dashboard (PoC):
   - `internal/web/web.go` – minimalni login (env `WEB_USERNAME`/`WEB_PASSWORD`), dashboard i forme
   - `web/templates/{login.html,dashboard.html}` – osnovni UI; proces pokreće POST na `/process_file_junior_call`
+- [x] Repo/ops higijena i cleanup:
+  - Dodan `.gitignore` (Go) – sprječava commit binarnih i build artefakata
+  - Preimenovan pipeline naziv u "Goling" (umjesto "Bart") kroz dokumentaciju
+  - Dodan orchestrator cleanup `CleanupTemps(1h)` i skripta `scripts/cleanup_tmp.sh` (za cron, briše `pdfdl-*.pdf` i `s3pdf-*.pdf` starije od 1h)
+  - Dashboard endpoint `/web/process` koristi isti Goling pipeline (proxy na API) – bez dupliranja logike
+- [x] Dispatcher fallback:
+  - Proširen multi‑model fallback: unutar providera pokušava i sekundarni model i na transient greškama (ne samo 429)
+  - Dodana fast‑model ruta kada payload sadrži `force_fast=true` (pokušaj fast modela primarnog pa sekundarnog providera)
+ - [x] Queue: migrirano s Redis LIST na Redis Streams + consumer groups; dodan delayed ZSET mover
+   - Kod: `internal/queue/redis.go` sada koristi `XADD/XREADGROUP/XACK` i `ZSET` za odgođene poslove
+   - Worker: `internal/dispatcher/worker.go` koristi per‑worker consumer ime (`w-<id>`) pri čitanju
+   - Glavni: `cmd/app/main.go` konstrukturu prosljeđuje `QUEUE_STREAM`, `QUEUE_GROUP` i `QUEUE_POLL_INTERVAL`
+   - Napomena: PoC ponašanje acka je „ack-on-read” (poruka se ACK‑a odmah po čitanju) radi paritete s prethodnim `BRPOP`; retry/DLQ slijedi u idućim koracima
 
 ## Sljedeći koraci
 - [x] Orchestrator: dodan skeleton MuPDF selekcije (heuristika, PoC) i enqueuing per-stranica.
@@ -316,10 +337,10 @@ for msg := range stream.ConsumerGroup("jobs:ai:pages", "workers:images") {
 - [ ] Orchestrator: integrirati napredne heuristike (tekst vs slika) i `content_ref` za page artefakte na S3.
 - [ ] Dispatcher: dodati adaptivni limiter i multi‑model fallback (primary→secondary; fast na zahtjev).
   - [x] Zamijenjeni stubovi za OpenAI/Anthropic realnim HTTP pozivima; mapiranje 429 → rate_limited
-- [ ] Queue: migrirati na Redis Streams + consumer groups, dodati delayed ZSET mover.
+- [x] Queue: migrirati na Redis Streams + consumer groups, dodati delayed ZSET mover.
 - [ ] Status: zamijeniti in‑memory status Redis‑om i izraditi rezultat agregaciju (S3/DB).
 - [ ] Axiom: dodati strukturirana polja (job_id, provider, model, attempt, duration).
-- [ ] Health i metrics: dodati `/metrics` (Prometheus) i health detalje.
+- [x] Health i metrics: dodati `/metrics` (Prometheus) i osnovne metrike (provider requests, latencije, retry/DLQ, depth)
 
 ---
 
@@ -330,7 +351,8 @@ Napomena: Binarne datoteke ne stavljati u Redis. Koristiti samo reference (lokal
 Ovaj odjeljak definira hibridni Orchestrator koji prima zahtjeve od GhostServer‑a (POST `/process_file_junior_call`), odlučuje koje stranice obraditi lokalno (MuPDF) a koje preko AI Dispatchera, ažurira progres i pohranjuje rezultate. Orchestrator i Dispatcher rade u istom servisu, ali su jasno odvojeni paketi/binariji za kasniji split.
 
 ### API Endpoints
-- POST `/process_file_junior_call`: prihvaća zahtjev za obradu jednog dokumenta.
+- POST `/process_file_junior_call`: prihvaća zahtjev za obradu jednog dokumenta (pipeline: Goling).
+- POST `/web/process`: dashboard endpoint koji poziva isti Goling pipeline (proxy prema API‑ju uz basic auth), bez dupliranja logike.
 - GET `/progress_spec/{job_id_or_file_id}`: vraća status i progres obrade.
 - GET `/health`, `/health_check`, `/status`: healthz.
  - POST `/webhook/cancel_job`: otkazivanje posla; zapis u Redis cancel set i ažuriranje statusa.
@@ -348,10 +370,10 @@ Ovaj odjeljak definira hibridni Orchestrator koji prima zahtjeve od GhostServer�
   - `processing_mode`, `ai_provider`, `options` (interno)
 
 ### Mapping ai_engine → provider/mode
-- `JuniorEngine` → `processing_mode=bart_1`, `ai_provider=openai`
-- `ClaudeEngine` → `processing_mode=bart_1`, `ai_provider=anthropic`
-- `OpenAIEngine` → `processing_mode=bart_1`, `ai_provider=openai`
-- default: `bart_1` + `openai`
+- `JuniorEngine` → `processing_mode=goling_1`, `ai_provider=openai`
+- `ClaudeEngine` → `processing_mode=goling_1`, `ai_provider=anthropic`
+- `OpenAIEngine` → `processing_mode=goling_1`, `ai_provider=openai`
+- default: `goling_1` + `openai`
 
 ### Tok za POST /process_file_junior_call
 1. Validacija i normalizacija polja (uz sanitizirano logiranje bez `password` i punog `ai_prompt`).
@@ -391,6 +413,8 @@ Ovaj odjeljak definira hibridni Orchestrator koji prima zahtjeve od GhostServer�
     - `RUN_DISPATCHER=1` (omogućuje workere u istom procesu)
     - `WORKER_CONCURRENCY` (default 8)
     - `REQUEST_TIMEOUT=60s`, `PAGE_TOTAL_TIMEOUT=120s`
+    - `MAX_INFLIGHT_PER_MODEL=2` (lokalni concurrency cap po modelu)
+    - `BREAKER_BASE_BACKOFF=30s`, `BREAKER_MAX_BACKOFF=5m` (429 cooldown per provider:model)
   - Provideri/Modeli:
     - `PRIMARY_ENGINE=openai|anthropic`, `SECONDARY_ENGINE=anthropic|openai`
     - `OPENAI_PRIMARY_MODEL`, `OPENAI_SECONDARY_MODEL`
@@ -421,7 +445,7 @@ Ovaj odjeljak definira hibridni Orchestrator koji prima zahtjeve od GhostServer�
 - `cmd/app/main.go`: entrypoint; starta HTTP server, Orchestrator, opcionalno Dispatcher workere.
 - `internal/orchestrator/*`: API rute, selekcija, MuPDF text extraction (go-fitz), agregacija i S3 spremanje.
 - `internal/dispatcher/worker.go`: per‑stranica obrada s timeoutima i failover logikom; šalje rezultat/fail Orchestratoru.
-- `internal/queue/redis.go`: minimalni queue (LIST); TODO: migracija na Streams.
+- `internal/queue/redis.go`: Redis Streams + consumer groups (`XADD/XREADGROUP/XACK`) i delayed ZSET mover.
 - `internal/store/status_redis.go`: Redis status store; `internal/store/page_redis.go`: per‑stranica tekst i agregacija.
 - `internal/ai/*`: klijenti za OpenAI i Anthropic (HTTP pozivi, 429 mapiranje).
 - `internal/logger/logger.go`: file rotacija + Axiom; `internal/config/env.go`: centralni config.

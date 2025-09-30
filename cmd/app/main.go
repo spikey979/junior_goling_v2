@@ -18,6 +18,7 @@ import (
     "github.com/local/aidispatcher/internal/queue"
     web "github.com/local/aidispatcher/internal/web"
     "github.com/local/aidispatcher/internal/store"
+    mpkg "github.com/local/aidispatcher/internal/metrics"
 )
 
 func main() {
@@ -41,7 +42,7 @@ func main() {
     defer logpkg.Close()
 
     // Queue
-    rq, err := queue.NewRedisQueue(cfg.Queue.RedisURL)
+    rq, err := queue.NewRedisQueue(cfg.Queue.RedisURL, cfg.Queue.Stream, cfg.Queue.Group, cfg.Queue.PollInterval)
     if err != nil {
         log.Fatal().Err(err).Msg("failed to connect to redis")
     }
@@ -67,6 +68,29 @@ func main() {
     })
     mux := http.NewServeMux()
     orch.RegisterRoutes(mux)
+    // Deep health route
+    mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request){
+        ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
+        defer cancel()
+        type resp struct { OK bool `json:"ok"`; Redis string `json:"redis"`; Stream int64 `json:"stream_len"`; Delayed int64 `json:"delayed_len"`; DLQ int64 `json:"dlq_len"` }
+        if err := rq.Ping(ctx); err != nil {
+            w.WriteHeader(http.StatusServiceUnavailable)
+            _, _ = w.Write([]byte(`{"ok":false,"redis":"down"}`))
+            return
+        }
+        s, d, dlq, err := rq.Depths(ctx)
+        if err != nil {
+            w.WriteHeader(http.StatusServiceUnavailable)
+            _, _ = w.Write([]byte(`{"ok":false,"redis":"error_depths"}`))
+            return
+        }
+        w.Header().Set("Content-Type", "application/json")
+        _, _ = w.Write([]byte(fmt.Sprintf(`{"ok":true,"redis":"ok","stream_len":%d,"delayed_len":%d,"dlq_len":%d}`, s, d, dlq)))
+    })
+
+    // Metrics
+    mpkg.Init()
+    mux.Handle("/metrics", mpkg.Handler())
 
     // Dashboard
     web := web.New()
@@ -88,6 +112,22 @@ func main() {
         log.Info().Msgf("HTTP server listening on :%s", port)
         if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
             log.Fatal().Err(err).Msg("http server error")
+        }
+    }()
+
+    // Background: publish queue depths to Prometheus
+    go func(){
+        ticker := time.NewTicker(5 * time.Second)
+        defer ticker.Stop()
+        for range ticker.C {
+            ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+            s, d, dlq, err := rq.Depths(ctx)
+            cancel()
+            if err == nil {
+                mpkg.SetQueueDepth("stream", s)
+                mpkg.SetQueueDepth("delayed", d)
+                mpkg.SetQueueDepth("dlq", dlq)
+            }
         }
     }()
 

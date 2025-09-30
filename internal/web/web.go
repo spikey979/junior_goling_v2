@@ -92,7 +92,7 @@ func (w *Web) handleProcess(wr http.ResponseWriter, r *http.Request) {
     userName := r.Form.Get("user_name")
     aiEngine := r.Form.Get("ai_engine")
     textOnly := r.Form.Get("text_only") == "on"
-    body := map[string]any{"file_path": filePath, "user_name": userName, "ai_engine": aiEngine, "text_only": textOnly}
+    body := map[string]any{"file_path": filePath, "user_name": userName, "ai_engine": aiEngine, "text_only": textOnly, "source": "dashboard"}
     b, _ := json.Marshal(body)
     url := fmt.Sprintf("http://127.0.0.1:%s/process_file_junior_call", w.port)
     resp, err := http.Post(url, "application/json", bytes.NewReader(b))
@@ -114,4 +114,3 @@ func (w *Web) handleProgress(wr http.ResponseWriter, r *http.Request) {
 }
 
 func getenv(k, d string) string { if v := os.Getenv(k); v != "" { return v }; return d }
-

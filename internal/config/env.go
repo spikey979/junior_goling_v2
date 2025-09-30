@@ -53,6 +53,9 @@ type WorkerConfig struct {
     RetryBaseDelay       time.Duration
     RetryJitter          time.Duration
     RetryBackoffFactor   float64
+    MaxInflightPerModel  int
+    BreakerBaseBackoff   time.Duration
+    BreakerMaxBackoff    time.Duration
 }
 
 // QueueConfig defines queue connectivity and names.
@@ -124,6 +127,9 @@ func FromEnv() Config {
         RetryBaseDelay:     parseDuration(getEnv("RETRY_BASE_DELAY", "2s"), 2*time.Second),
         RetryJitter:        parseDuration(getEnv("RETRY_JITTER", "200ms"), 200*time.Millisecond),
         RetryBackoffFactor: parseFloat(getEnv("RETRY_BACKOFF_FACTOR", "2.0"), 2.0),
+        MaxInflightPerModel: parseInt(getEnv("MAX_INFLIGHT_PER_MODEL", "2"), 2),
+        BreakerBaseBackoff:  parseDuration(getEnv("BREAKER_BASE_BACKOFF", "30s"), 30*time.Second),
+        BreakerMaxBackoff:   parseDuration(getEnv("BREAKER_MAX_BACKOFF", "5m"), 5*time.Minute),
     }
     if cfg.Worker.OpenAITimeout <= 0 { cfg.Worker.OpenAITimeout = cfg.Worker.RequestTimeout }
     if cfg.Worker.AnthropicTimeout <= 0 { cfg.Worker.AnthropicTimeout = cfg.Worker.RequestTimeout }
