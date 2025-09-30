@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.17.2
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.57.0
 	github.com/axiomhq/axiom-go v0.25.0
-	github.com/gen2brain/go-fitz v1.22.2
+	github.com/gen2brain/go-fitz v1.24.15
 	github.com/google/uuid v1.6.0
 	github.com/pdfcpu/pdfcpu v0.6.0
 	github.com/prometheus/client_golang v1.18.0
@@ -37,6 +37,7 @@ require (
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
+	github.com/ebitengine/purego v0.8.4 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -44,6 +45,7 @@ require (
 	github.com/gorilla/mux v1.8.1 // indirect
 	github.com/hhrutter/lzw v1.0.0 // indirect
 	github.com/hhrutter/tiff v1.0.1 // indirect
+	github.com/jupiterrider/ffi v0.5.0 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect

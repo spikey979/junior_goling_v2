@@ -16,6 +16,7 @@ import (
     "github.com/local/aidispatcher/internal/dispatcher"
     "github.com/local/aidispatcher/internal/orchestrator"
     "github.com/local/aidispatcher/internal/queue"
+    "github.com/local/aidispatcher/internal/statuscheck"
     web "github.com/local/aidispatcher/internal/web"
     "github.com/local/aidispatcher/internal/store"
     mpkg "github.com/local/aidispatcher/internal/metrics"
@@ -93,7 +94,13 @@ func main() {
     mux.Handle("/metrics", mpkg.Handler())
 
     // Dashboard
-    web := web.New()
+    statusChecker := statuscheck.New(statuscheck.Options{
+        Redis:       rq,
+        S3Bucket:    os.Getenv("AWS_S3_BUCKET"),
+        OpenAIKey:   os.Getenv("OPENAI_API_KEY"),
+        AnthropicKey: os.Getenv("ANTHROPIC_API_KEY"),
+    })
+    web := web.New(statusChecker)
     web.RegisterRoutes(mux)
 
     // Dispatcher worker (optional)

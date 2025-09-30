@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Dashboard Test</title>
+<style>
+  body { font-family: sans-serif; padding: 20px; background: #f5f5f5; }
+  .test-panel { background: white; padding: 20px; border-radius: 8px; max-width: 800px; margin: 0 auto; }
+  h2 { color: #333; }
+  .test-btn { background: #3b82f6; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin: 10px 5px; }
+  .test-btn:hover { background: #2563eb; }
+  .result { background: #f0f0f0; padding: 10px; margin-top: 10px; border-radius: 4px; font-family: monospace; }
+  .success { color: green; }
+  .error { color: red; }
+</style>
+</head>
+<body>
+  <div class="test-panel">
+    <h2>🧪 Dashboard Feature Test</h2>
+
+    <h3>Test Progress Bar & Result Display</h3>
+    <button class="test-btn" onclick="testUpload()">Test MuPDF Upload</button>
+    <button class="test-btn" onclick="checkJob()">Check Last Job</button>
+
+    <div id="result" class="result">Ready for testing...</div>
+
+    <h3>Last Job ID:</h3>
+    <input type="text" id="jobId" style="width: 100%; padding: 5px;" placeholder="Job ID will appear here">
+  </div>
+
+  <script>
+    let lastJobId = null;
+
+    async function testUpload() {
+      const resultDiv = document.getElementById('result');
+      resultDiv.innerHTML = 'Creating test upload...';
+
+      // Create a small test text file
+      const testContent = `Test Document\n\nThis is a test document for MuPDF extraction.\n\nPage 1 content here.\nSome more text to extract.`;
+      const blob = new Blob([testContent], { type: 'text/plain' });
+      const file = new File([blob], 'test.txt', { type: 'text/plain' });
+
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('user_name', 'test@example.com');
+      formData.append('ai_engine', 'OpenAIEngine');
+      formData.append('text_only', 'true');
+
+      try {
+        const response = await fetch('http://localhost:8081/web/upload', {
+          method: 'POST',
+          headers: { 'Cookie': 'auth=1' },
+          body: formData
+        });
+
+        const data = await response.json();
+        lastJobId = data.job_id;
+        document.getElementById('jobId').value = lastJobId;
+
+        resultDiv.innerHTML = `<span class="success">✅ Upload successful!</span><br>Job ID: ${lastJobId}<br>Status: ${data.message}`;
+
+        // Start polling
+        setTimeout(() => pollStatus(lastJobId), 500);
+      } catch(err) {
+        resultDiv.innerHTML = `<span class="error">❌ Error: ${err.message}</span>`;
+      }
+    }
+
+    async function checkJob() {
+      const jobId = document.getElementById('jobId').value || lastJobId;
+      if (!jobId) {
+        alert('No job ID available');
+        return;
+      }
+
+      const resultDiv = document.getElementById('result');
+      try {
+        const response = await fetch(`http://localhost:8081/progress_spec/${jobId}`);
+        const data = await response.json();
+
+        resultDiv.innerHTML = `<strong>Job Status:</strong><br>` +
+          `Status: ${data.status}<br>` +
+          `Progress: ${data.progress}%<br>` +
+          `Message: ${data.message}<br>`;
+
+        if (data.status === 'success') {
+          resultDiv.innerHTML += `<span class="success">✅ Job completed successfully!</span>`;
+
+          // Try to fetch result
+          const resultResp = await fetch(`http://localhost:8081/download_result/${jobId}`);
+          if (resultResp.ok) {
+            const text = await resultResp.text();
+            resultDiv.innerHTML += `<br><br><strong>Extracted Text (first 500 chars):</strong><br>${text.substring(0, 500)}...`;
+          }
+        }
+      } catch(err) {
+        resultDiv.innerHTML = `<span class="error">❌ Error checking job: ${err.message}</span>`;
+      }
+    }
+
+    async function pollStatus(jobId) {
+      const resultDiv = document.getElementById('result');
+
+      try {
+        const response = await fetch(`http://localhost:8081/progress_spec/${jobId}`);
+        const data = await response.json();
+
+        resultDiv.innerHTML = `<strong>Processing...</strong><br>` +
+          `Progress: ${data.progress}%<br>` +
+          `Status: ${data.status}<br>` +
+          `Message: ${data.message}`;
+
+        if (data.status === 'success' || data.status === 'failed') {
+          // Job finished
+          if (data.status === 'success') {
+            resultDiv.innerHTML += `<br><span class="success">✅ Completed!</span>`;
+            checkJob(); // Load full result
+          } else {
+            resultDiv.innerHTML += `<br><span class="error">❌ Failed!</span>`;
+          }
+        } else {
+          // Continue polling
+          setTimeout(() => pollStatus(jobId), 500);
+        }
+      } catch(err) {
+        resultDiv.innerHTML = `<span class="error">❌ Polling error: ${err.message}</span>`;
+      }
+    }
+  </script>
+</body>
+</html>

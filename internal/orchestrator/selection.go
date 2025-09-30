@@ -20,22 +20,12 @@ type SelectionOptions struct {
 }
 
 // SelectPages implementira minimalnu heuristiku:
-// - Ako je TextOnly: sve stranice idu u MuPDF
-// - Inače: svaku drugu stranicu šaljemo na AI (PoC), ostalo MuPDF
+// - Privremeno: isključujemo MuPDF obradu i sve stranice šaljemo na AI.
 func SelectPages(opts SelectionOptions) SelectionResult {
     if opts.TotalPages <= 0 { opts.TotalPages = 3 }
     res := SelectionResult{}
     for i := 1; i <= opts.TotalPages; i++ {
-        if opts.TextOnly {
-            res.MuPDFPages = append(res.MuPDFPages, i)
-            continue
-        }
-        if i%2 == 0 {
-            res.AIPages = append(res.AIPages, i)
-        } else {
-            res.MuPDFPages = append(res.MuPDFPages, i)
-        }
+        res.AIPages = append(res.AIPages, i)
     }
     return res
 }
-

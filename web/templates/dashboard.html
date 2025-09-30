@@ -44,7 +44,7 @@
     .logout-btn { background: rgba(255,255,255,0.15); color: #fff; padding: .5rem 1rem; border-radius: 999px; text-decoration: none; transition: all .15s ease; }
     .logout-btn:hover { background: rgba(255,255,255,0.25); transform: translateY(-1px); }
 
-    .container { max-width: 1200px; margin: 2rem auto; padding: 0 1.5rem; display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
+    .container { max-width: 1400px; margin: 2rem auto; padding: 0 1.5rem; display: grid; grid-template-columns: 1fr 0.5fr; gap: 2rem; }
     @media (max-width: 900px) { .container { grid-template-columns: 1fr; } }
     .right-col { display: grid; gap: 1.5rem; align-content: start; }
 
@@ -69,7 +69,8 @@
 
     /* Upload (drag & drop) */
     .upload-section { position: relative; border: 2px dashed var(--border-color); border-radius: var(--radius); padding: 1.25rem; text-align: center; background: var(--soft-surface); transition: all .15s ease; }
-    .upload-section:hover { border-color: var(--primary-color); transform: translateY(-1px); box-shadow: var(--shadow-sm); }
+    .upload-section:hover, .upload-section.dragover { border-color: var(--primary-color); transform: translateY(-1px); box-shadow: var(--shadow-sm); }
+    .upload-section.dragover { background: rgba(37,99,235,0.08); }
     .upload-icon { font-size: 2rem; opacity: 0.8; margin-bottom: .5rem; }
     .upload-text { color: var(--text-muted); margin-bottom: .75rem; }
     .upload-supported { color: var(--text-muted); font-size: .85rem; margin-bottom: .75rem; }
@@ -78,6 +79,33 @@
     .file-input-label:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); }
     .file-selected { margin-top: .5rem; color: var(--text-muted); font-size: .9rem; }
     .error-msg { margin-top: .5rem; color: #b91c1c; font-weight: 600; }
+    .status-grid { display: grid; gap: .6rem; }
+    .status-row { display: flex; align-items: center; justify-content: space-between; padding: .4rem .2rem; border-bottom: 1px solid var(--border-color); }
+    .status-row:last-child { border-bottom: none; }
+    .status-name { font-weight: 600; color: var(--text-color); }
+    .status-badge { display: inline-flex; align-items: center; gap: .35rem; font-weight: 600; }
+    .status-badge::before { content: '●'; font-size: .6rem; }
+    .status-ok { color: #047857; }
+    .status-ok::before { color: #10b981; }
+    .status-fail { color: #b91c1c; }
+    .status-fail::before { color: #ef4444; }
+    .status-pending { color: var(--text-muted); }
+    .status-pending::before { color: #9ca3af; animation: pulse 1.2s ease-in-out infinite; }
+    @keyframes pulse {
+      0% { opacity: .4; }
+      50% { opacity: 1; }
+      100% { opacity: .4; }
+    }
+
+    /* Progress section */
+    .progress-section { margin-top: 1.5rem; padding: 1rem; background: var(--card-bg); border-radius: var(--radius); border: 1px solid var(--border-color); display: none; }
+    .progress-bar-container { background: var(--border-color); height: 24px; border-radius: var(--radius-sm); overflow: hidden; margin-bottom: .75rem; position: relative; }
+    .progress-bar { height: 100%; background: var(--primary-gradient); transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; color: white; font-weight: 600; font-size: 0.85rem; }
+    .progress-info { display: flex; justify-content: space-between; margin-bottom: .5rem; }
+    .progress-status { color: var(--text-color); font-weight: 600; }
+    .progress-timer { color: var(--text-muted); font-family: monospace; }
+    .result-area { margin-top: 1rem; }
+    .result-textarea { width: 100%; min-height: 400px; padding: 1rem; background: #0b1220; color: #e5e7eb; border: 1px solid var(--border-color); border-radius: var(--radius-sm); font-family: 'Courier New', monospace; font-size: .9rem; resize: vertical; }
   </style>
   </head>
 <body>
@@ -95,7 +123,7 @@
         <h2>📄 Start Processing</h2>
       </div>
       <div class="card-body">
-        <form class="form" method="post" action="/web/process">
+        <form id="upload_form" class="form" method="post" action="/web/process">
           <div class="form-group">
             <label for="file_path">File path/URL (S3 key or s3://)</label>
             <input id="file_path" name="file_path" placeholder="s3://bucket/key.pdf" />
@@ -105,7 +133,7 @@
             <input id="user_name" name="user_name" placeholder="user@example.com" />
           </div>
           <!-- Drag & Drop Upload (UI + delayed submit on Process) -->
-          <div class="upload-section" aria-label="Upload file">
+          <div id="upload_box" class="upload-section" aria-label="Upload file">
             <div class="upload-icon">📤</div>
             <div class="upload-text">Drag & drop a file here</div>
             <div class="upload-supported">Supported: pdf, docx, pptx, vsdx, doc, ppt, txt</div>
@@ -127,7 +155,28 @@
           </label>
           <button id="processBtn" class="btn btn-primary" type="submit">Process</button>
         </form>
-        <p class="helper">The call result will be shown as JSON.</p>
+
+        <!-- Progress Section -->
+        <div id="progress_section" class="progress-section">
+          <div class="progress-info">
+            <span class="progress-status" id="progress_status">Processing...</span>
+            <span class="progress-timer" id="progress_timer">00:00</span>
+          </div>
+          <div class="progress-bar-container">
+            <div class="progress-bar" id="progress_bar" style="width: 0%">0%</div>
+          </div>
+          <div id="progress_message" style="color: var(--text-muted); font-size: 0.9rem; margin-top: 0.5rem;"></div>
+        </div>
+
+        <!-- Result Display Area -->
+        <div id="result_section" class="result-area" style="display:none;">
+          <h3 style="margin-bottom: 0.5rem;">Extracted Text:</h3>
+          <textarea id="result_text" class="result-textarea" readonly placeholder="Processing..."></textarea>
+          <div style="margin-top: 0.5rem; display: flex; justify-content: space-between;">
+            <span id="result_stats" style="color: var(--text-muted); font-size: 0.9rem;"></span>
+            <button id="copy_btn" class="btn btn-primary" onclick="copyResult()" style="padding: 0.4rem 1rem; font-size: 0.9rem;">Copy Text</button>
+          </div>
+        </div>
       </div>
     </section>
     </div>
@@ -154,18 +203,30 @@
           <h2>🖥️ System Status</h2>
         </div>
         <div class="card-body">
-          <div class="form">
-            <div class="form-group">
-              <label>Overall</label>
-              <div class="helper">Online • All services healthy</div>
+          <div class="status-grid" id="system_status">
+            <div class="status-row" data-status="redis">
+              <span class="status-name">Redis</span>
+              <span class="status-badge status-pending">Checking…</span>
             </div>
-            <div class="form-group">
-              <label>Queue</label>
-              <div class="helper">jobs: 0 • delayed: 0 • dlq: 0</div>
+            <div class="status-row" data-status="s3">
+              <span class="status-name">S3 Storage</span>
+              <span class="status-badge status-pending">Checking…</span>
             </div>
-            <div class="form-group">
-              <label>Workers</label>
-              <div class="helper">active: 0 • concurrency: 0</div>
+            <div class="status-row" data-status="libreoffice">
+              <span class="status-name">LibreOffice</span>
+              <span class="status-badge status-pending">Checking…</span>
+            </div>
+            <div class="status-row" data-status="openai">
+              <span class="status-name">OpenAI</span>
+              <span class="status-badge status-pending">Checking…</span>
+            </div>
+            <div class="status-row" data-status="anthropic">
+              <span class="status-name">Anthropic</span>
+              <span class="status-badge status-pending">Checking…</span>
+            </div>
+            <div class="status-row" data-status="mupdf">
+              <span class="status-name">MuPDF</span>
+              <span class="status-badge status-pending">Checking…</span>
             </div>
           </div>
         </div>
@@ -200,6 +261,19 @@
   </div>
 
   <script>
+    // Copy result to clipboard
+    function copyResult() {
+      const textarea = document.getElementById('result_text');
+      if(textarea && textarea.value) {
+        navigator.clipboard.writeText(textarea.value).then(() => {
+          const btn = document.getElementById('copy_btn');
+          const originalText = btn.textContent;
+          btn.textContent = 'Copied!';
+          setTimeout(() => { btn.textContent = originalText; }, 2000);
+        });
+      }
+    }
+
     async function ev(e){
       e.preventDefault();
       const jid = document.getElementById('jid').value;
@@ -211,14 +285,17 @@
     // Upload selection and guarded submit
     (function(){
       const allowed = [".pdf",".docx",".pptx",".vsdx",".doc",".ppt",".txt"]; 
-      const uploadBox = document.querySelector('.upload-section');
+      const uploadBox = document.getElementById('upload_box');
       const fileInput = document.getElementById('file_input');
       const fileSelected = document.getElementById('file_selected');
       const fileError = document.getElementById('file_error');
-      const form = document.querySelector('form.form');
+      const form = document.getElementById('upload_form');
+      const userInput = document.getElementById('user_name');
       const outPre = document.getElementById('out');
       const jidInput = document.getElementById('jid');
       let selectedFile = null;
+
+      if(!uploadBox || !form){ return; }
 
       function extOK(name){
         const lower = (name||'').toLowerCase();
@@ -232,20 +309,106 @@
         fileError.style.display='block'; fileError.textContent = msg;
       }
 
-      // Drag & drop
-      ['dragenter','dragover'].forEach(evName=>{
-        uploadBox.addEventListener(evName, (e)=>{ e.preventDefault(); e.stopPropagation(); uploadBox.classList.add('dragover'); });
+      // Prevent default drag behaviors on document
+      document.addEventListener('dragover', (e) => {
+        e.preventDefault();
       });
-      ['dragleave','drop'].forEach(evName=>{
-        uploadBox.addEventListener(evName, (e)=>{ e.preventDefault(); e.stopPropagation(); uploadBox.classList.remove('dragover'); });
+      document.addEventListener('drop', (e) => {
+        e.preventDefault();
       });
-      uploadBox.addEventListener('drop', (e)=>{
-        const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-        if(!f) return;
-        if(!extOK(f.name)) { showError('Unsupported file type. Allowed: ' + allowed.join(', ')); return; }
-        selectedFile = f; showSelected(f); showError('');
-        // also reflect into input for consistency
-        const dt = new DataTransfer(); dt.items.add(f); fileInput.files = dt.files;
+
+      // Drag & drop handlers for upload box
+      uploadBox.addEventListener('dragenter', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        uploadBox.classList.add('dragover');
+      });
+
+      uploadBox.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        uploadBox.classList.add('dragover');
+      });
+
+      uploadBox.addEventListener('dragleave', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        // Check if we're actually leaving the upload box
+        if (e.target === uploadBox || !uploadBox.contains(e.relatedTarget)) {
+          uploadBox.classList.remove('dragover');
+        }
+      });
+
+      uploadBox.addEventListener('drop', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        uploadBox.classList.remove('dragover');
+
+        // Debug logging
+        console.log('Drop event:', e);
+        console.log('dataTransfer:', e.dataTransfer);
+
+        if (!e.dataTransfer) {
+          console.error('No dataTransfer object');
+          showError('Browser does not support file drop');
+          return;
+        }
+
+        // Try multiple methods to get files
+        let fileToProcess = null;
+
+        // Method 1: Try files property
+        if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+          console.log('Got file from dataTransfer.files');
+          fileToProcess = e.dataTransfer.files[0];
+        }
+        // Method 2: Try items property
+        else if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+          console.log('Trying dataTransfer.items...');
+          for (let i = 0; i < e.dataTransfer.items.length; i++) {
+            const item = e.dataTransfer.items[i];
+            console.log('Item', i, ':', item.kind, item.type);
+
+            if (item.kind === 'file') {
+              const file = item.getAsFile();
+              if (file) {
+                console.log('Got file from item.getAsFile()');
+                fileToProcess = file;
+                break;
+              }
+            }
+          }
+        }
+
+        if (!fileToProcess) {
+          console.error('Could not extract file from drop event');
+          console.log('dataTransfer.files:', e.dataTransfer.files);
+          console.log('dataTransfer.items:', e.dataTransfer.items);
+          console.log('dataTransfer.types:', e.dataTransfer.types);
+          showError('Could not process dropped file. Try using the Choose File button.');
+          return;
+        }
+
+        console.log('File detected:', fileToProcess.name, fileToProcess.size, fileToProcess.type);
+
+        if (!extOK(fileToProcess.name)) {
+          showError('Unsupported file type. Allowed: ' + allowed.join(', '));
+          return;
+        }
+
+        selectedFile = fileToProcess;
+        showSelected(fileToProcess);
+        showError('');
+
+        // Try to sync with file input (for visual consistency)
+        try {
+          const dt = new DataTransfer();
+          dt.items.add(fileToProcess);
+          fileInput.files = dt.files;
+        } catch (err) {
+          // Some browsers don't support DataTransfer, that's OK
+          console.log('Could not sync file input:', err);
+        }
       });
 
       // Choose file
@@ -256,30 +419,240 @@
         selectedFile = f; showSelected(f); showError('');
       });
 
+      // Processing state management
+      let processingJobId = null;
+      let pollingInterval = null;
+      let timerInterval = null;
+      let startTime = null;
+
+      function startTimer() {
+        startTime = Date.now();
+        const timerEl = document.getElementById('progress_timer');
+        timerInterval = setInterval(() => {
+          const elapsed = Math.floor((Date.now() - startTime) / 1000);
+          const minutes = Math.floor(elapsed / 60);
+          const seconds = elapsed % 60;
+          timerEl.textContent = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+        }, 100);
+      }
+
+      function stopTimer() {
+        if(timerInterval) {
+          clearInterval(timerInterval);
+          timerInterval = null;
+        }
+      }
+
+      function updateProgress(progress, status, message) {
+        const progressBar = document.getElementById('progress_bar');
+        const progressStatus = document.getElementById('progress_status');
+        const progressMessage = document.getElementById('progress_message');
+
+        progressBar.style.width = progress + '%';
+        progressBar.textContent = progress + '%';
+
+        if(status) progressStatus.textContent = status;
+        if(message) progressMessage.textContent = message;
+      }
+
+      async function pollJobStatus(jobId) {
+        try {
+          const resp = await fetch(`/progress_spec/${jobId}`);
+          if(!resp.ok) return;
+
+          const data = await resp.json();
+
+          // Update progress
+          const progress = data.progress || 0;
+          const status = data.status || 'processing';
+          const message = data.message || '';
+
+          updateProgress(progress,
+            status === 'success' ? 'Completed!' :
+            status === 'failed' ? 'Failed' :
+            status === 'processing' ? 'Processing...' :
+            'Queued',
+            message
+          );
+
+          // Check if completed
+          if(status === 'success' || status === 'failed') {
+            stopTimer();
+            if(pollingInterval) {
+              clearInterval(pollingInterval);
+              pollingInterval = null;
+            }
+
+            // If success, fetch the result
+            if(status === 'success') {
+              const metadata = data.metadata || {};
+              const source = metadata.source;
+
+              console.log('Job succeeded, metadata:', metadata);
+              console.log('Source:', source);
+
+              if(source === 'upload') {
+                // Fetch result text
+                const resultResp = await fetch(`/download_result/${jobId}`);
+                console.log('Download result response status:', resultResp.status);
+
+                if(resultResp.ok) {
+                  const resultText = await resultResp.text();
+                  const resultTextarea = document.getElementById('result_text');
+                  const resultSection = document.getElementById('result_section');
+                  const resultStats = document.getElementById('result_stats');
+
+                  console.log('Got result text, length:', resultText.length);
+
+                  resultTextarea.value = resultText;
+                  resultSection.style.display = 'block';
+
+                  // Show stats
+                  const charCount = resultText.length;
+                  const pageCount = metadata.total_pages || 0;
+                  const processingTime = metadata.processing_time ? metadata.processing_time.toFixed(1) : '0';
+                  resultStats.textContent = `${charCount.toLocaleString()} characters | ${pageCount} pages | ${processingTime}s`;
+                } else {
+                  console.error('Failed to download result, status:', resultResp.status);
+                  // Show result section anyway with error message
+                  const resultSection = document.getElementById('result_section');
+                  const resultTextarea = document.getElementById('result_text');
+                  resultSection.style.display = 'block';
+                  resultTextarea.value = 'Error: Could not download result text. Please check console for details.';
+                }
+              } else {
+                // For non-upload sources, still show something
+                console.log('Non-upload source, showing completion message');
+                const resultSection = document.getElementById('result_section');
+                const resultTextarea = document.getElementById('result_text');
+                resultSection.style.display = 'block';
+                resultTextarea.value = `Processing completed successfully!\n\nJob ID: ${jobId}\nStatus: ${status}\nMessage: ${message}\n\nNote: Result display is only available for uploaded files.`;
+              }
+            } else if(status === 'failed') {
+              showError('Processing failed: ' + message);
+            }
+          }
+        } catch(err) {
+          console.error('Poll error:', err);
+        }
+      }
+
       // Intercept submit: require file, then POST to /web/upload
       form.addEventListener('submit', async (e)=>{
         e.preventDefault();
         if(!selectedFile){ showError('Please choose a file before processing.'); return; }
+        const userName = (userInput && userInput.value ? userInput.value.trim() : '');
+        if(!userName){ showError('Please enter a user name.'); if(userInput){ userInput.focus(); } return; }
+
         const btn = document.getElementById('processBtn');
+        const progressSection = document.getElementById('progress_section');
+        const resultSection = document.getElementById('result_section');
+        const resultTextarea = document.getElementById('result_text');
+
+        // Reset UI
         btn.disabled = true;
+        progressSection.style.display = 'block';
+        resultSection.style.display = 'none';
+        resultTextarea.value = '';
+        updateProgress(0, 'Uploading...', 'Sending file to server');
+        startTimer();
+
         try {
           const fd = new FormData();
           fd.append('file', selectedFile);
-          fd.append('user_name', document.getElementById('user_name').value || '');
+          fd.append('user_name', userName);
           fd.append('ai_engine', document.getElementById('ai_engine').value || '');
           const textOnly = form.querySelector('input[name="text_only"]').checked;
           fd.append('text_only', textOnly ? 'true' : 'false');
 
           const resp = await fetch('/web/upload', { method: 'POST', body: fd });
-          const txt = await resp.text();
-          outPre.textContent = txt;
-          try { const js = JSON.parse(txt); if(js && js.job_id){ jidInput.value = js.job_id; } } catch {}
+          if(!resp.ok){
+            const errText = await resp.text();
+            showError(errText || 'Upload failed');
+            progressSection.style.display = 'none';
+            stopTimer();
+            btn.disabled = false;
+            return;
+          }
+
+          const result = await resp.json();
+          if(result.job_id) {
+            processingJobId = result.job_id;
+            jidInput.value = result.job_id;
+
+            // Start polling for status
+            updateProgress(5, 'Processing...', 'Job created, starting processing');
+            pollingInterval = setInterval(() => {
+              pollJobStatus(processingJobId);
+            }, 500); // Poll every 500ms
+
+            // Initial poll
+            pollJobStatus(processingJobId);
+          }
+
+          showError('');
         } catch (err) {
           showError('Upload failed: ' + (err && err.message ? err.message : String(err)));
+          progressSection.style.display = 'none';
+          stopTimer();
         } finally {
           btn.disabled = false;
         }
       });
+    })();
+
+    // System status polling
+    (function(){
+      const rows = document.querySelectorAll('#system_status [data-status]');
+      if(!rows.length) { return; }
+
+      function updateRow(key, payload){
+        const row = document.querySelector(`#system_status [data-status="${key}"]`);
+        if(!row) { return; }
+        const badge = row.querySelector('.status-badge');
+        if(!badge) { return; }
+        badge.classList.remove('status-ok','status-fail','status-pending');
+        if(payload && payload.ok){
+          badge.classList.add('status-ok');
+          badge.textContent = payload.message || 'Available';
+        } else {
+          badge.classList.add('status-fail');
+          badge.textContent = (payload && payload.message) ? payload.message : 'Unavailable';
+        }
+      }
+
+      async function loadStatus(){
+        try {
+          const resp = await fetch('/web/system_status');
+          if(!resp.ok){ throw new Error('HTTP '+resp.status); }
+          const data = await resp.json();
+          updateRow('redis', data.redis);
+          updateRow('s3', data.s3);
+          updateRow('libreoffice', data.libreoffice);
+          updateRow('openai', data.openai);
+          updateRow('anthropic', data.anthropic);
+          updateRow('mupdf', data.mupdf);
+        } catch (err) {
+          ['redis','s3','libreoffice','openai','anthropic','mupdf'].forEach(key => {
+            updateRow(key, { ok: false, message: 'Error' });
+          });
+        }
+      }
+
+      function markPending(){
+        rows.forEach(row => {
+          const badge = row.querySelector('.status-badge');
+          if(badge){
+            badge.classList.remove('status-ok','status-fail');
+            badge.classList.add('status-pending');
+            badge.textContent = 'Checking…';
+          }
+        });
+      }
+
+      markPending();
+      loadStatus();
+      setInterval(loadStatus, 15000);
     })();
   </script>
 </body>

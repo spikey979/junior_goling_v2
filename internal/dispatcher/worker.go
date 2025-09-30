@@ -86,7 +86,7 @@ func (w *Worker) loop(id int) {
         pageID := intFromAny(payload["page_id"]) 
         if jobID != "" {
             if cancelled, _ := w.q.IsCancelled(context.Background(), jobID); cancelled {
-                log.Warn().Int("worker", id).Str("job_id", jobID).Msg("job cancelled before processing; skipping")
+                log.Warn().Int("worker", id).Str("job_id", jobID).Int("page_id", pageID).Msg("job cancelled before processing; skipping")
                 continue
             }
         }
@@ -95,16 +95,22 @@ func (w *Worker) loop(id int) {
         forceFast := boolFromAny(payload["force_fast"]) 
 
         overallCtx, cancelOverall := context.WithTimeout(context.Background(), w.conf.Worker.PageTotalTimeout)
-        defer cancelOverall()
+
+        attempt := intFromAny(payload["attempt"])
+        if attempt <= 0 { attempt = 1 }
+        log.Info().Int("worker", id).Str("job_id", jobID).Int("page_id", pageID).Int("attempt", attempt).
+            Str("preferred_engine", preferEngine).Str("content_ref", contentRef).Msg("dispatcher picked page")
 
         // Idempotency: skip provider call if already done
         idemKey, _ := payload["idempotency_key"].(string)
         if done, _ := w.q.IsIdemDone(context.Background(), idemKey); done {
             _ = w.q.Ack(context.Background(), msgID)
+            cancelOverall()
+            log.Info().Int("worker", id).Str("job_id", jobID).Int("page_id", pageID).Str("idempotency_key", idemKey).Msg("skipping already processed page")
             continue
         }
 
-        ok, provider, model, text := w.processPage(overallCtx, jobID, pageID, contentRef, preferEngine, forceFast)
+        ok, provider, model, text, perr := w.processPage(overallCtx, jobID, pageID, contentRef, preferEngine, forceFast)
         source, _ := payload["source"].(string)
         if source == "" { source = "api" }
         if ok {
@@ -117,6 +123,9 @@ func (w *Worker) loop(id int) {
             _ = w.q.Ack(context.Background(), msgID)
             mpkg.IncProcessed("success")
             mpkg.IncProcessedAttr("success", source, forceFast)
+            cancelOverall()
+            log.Info().Int("worker", id).Str("job_id", jobID).Int("page_id", pageID).Str("provider", provider).
+                Str("model", model).Int("attempt", attempt).Int("text_len", len(text)).Msg("page processed successfully")
         } else {
             // retry with backoff or DLQ
             attempt := intFromAny(payload["attempt"]) 
@@ -130,6 +139,8 @@ func (w *Worker) loop(id int) {
                 _, _ = http.Post(url, "text/plain", nil)
                 mpkg.IncProcessed("dlq")
                 mpkg.IncProcessedAttr("dlq", source, forceFast)
+                log.Error().Int("worker", id).Str("job_id", jobID).Int("page_id", pageID).Int("attempt", attempt).
+                    Err(perr).Msg("page failed max attempts; sent to DLQ")
             } else {
                 // requeue delayed with incremented attempt
                 payload["attempt"] = attempt + 1
@@ -139,7 +150,10 @@ func (w *Worker) loop(id int) {
                 _ = w.q.Ack(context.Background(), msgID)
                 mpkg.IncRetry()
                 mpkg.IncRetryAttr(source, forceFast)
+                log.Warn().Int("worker", id).Str("job_id", jobID).Int("page_id", pageID).Int("attempt", attempt).
+                    Dur("retry_in", delay).Err(perr).Msg("page processing failed; scheduled retry")
             }
+            cancelOverall()
         }
     }
 }
@@ -180,7 +194,7 @@ func backoffDelay(base time.Duration, factor float64, attempt int) time.Duration
     return time.Duration(d)
 }
 
-func (w *Worker) processPage(ctx context.Context, jobID string, pageID int, contentRef, preferEngine string, forceFast bool) (bool, string, string, string) {
+func (w *Worker) processPage(ctx context.Context, jobID string, pageID int, contentRef, preferEngine string, forceFast bool) (bool, string, string, string, error) {
     // Determine providers and models from config
     primaryProv := w.conf.Providers.PrimaryEngine
     secondaryProv := w.conf.Providers.SecondaryEngine
@@ -207,6 +221,8 @@ func (w *Worker) processPage(ctx context.Context, jobID string, pageID int, cont
         dur := time.Since(start)
         if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
             mpkg.ObserveProvider(provider, model, "timeout", dur)
+            log.Warn().Str("job_id", jobID).Int("page_id", pageID).Str("provider", provider).Str("model", model).
+                Dur("duration", dur).Msg("provider timeout")
             return ai.Response{}, context.DeadlineExceeded
         }
         // classify
@@ -215,16 +231,26 @@ func (w *Worker) processPage(ctx context.Context, jobID string, pageID int, cont
             if ai.IsRateLimited(err) { result = "rate_limited" } else if isTransient(err) { result = "transient" } else { result = "fatal" }
         }
         mpkg.ObserveProvider(provider, model, result, dur)
+        if err != nil {
+            log.Warn().Str("job_id", jobID).Int("page_id", pageID).Str("provider", provider).Str("model", model).
+                Dur("duration", dur).Err(err).Msg("provider call failed")
+        } else {
+            log.Debug().Str("job_id", jobID).Int("page_id", pageID).Str("provider", provider).Str("model", model).
+                Dur("duration", dur).Int("tokens_in", resp.TokensIn).Int("tokens_out", resp.TokensOut).Msg("provider call success")
+        }
         return resp, err
     }
 
     // Fast-path: only fast models if requested
+    var lastErr error
     if forceFast {
         fModel := w.fastModel(primaryProv)
         if fModel != "" && !w.lim.IsOpen(ctx, primaryProv, fModel) {
             relF, okF := w.lim.Allow(primaryProv, fModel)
             if okF {
-                if resp, err := call(primaryProv, fModel); err == nil { relF(); w.lim.Close(ctx, primaryProv, fModel); return true, primaryProv, fModel, resp.Text }
+                if resp, err := call(primaryProv, fModel); err == nil {
+                    relF(); w.lim.Close(ctx, primaryProv, fModel); return true, primaryProv, fModel, resp.Text, nil
+                }
                 relF()
             }
         }
@@ -232,11 +258,16 @@ func (w *Worker) processPage(ctx context.Context, jobID string, pageID int, cont
         if sfModel != "" && !w.lim.IsOpen(ctx, secondaryProv, sfModel) {
             relSF, okSF := w.lim.Allow(secondaryProv, sfModel)
             if okSF {
-                if resp2, err2 := call(secondaryProv, sfModel); err2 == nil { relSF(); w.lim.Close(ctx, secondaryProv, sfModel); return true, secondaryProv, sfModel, resp2.Text }
+                if resp2, err2 := call(secondaryProv, sfModel); err2 == nil {
+                    relSF(); w.lim.Close(ctx, secondaryProv, sfModel); return true, secondaryProv, sfModel, resp2.Text, nil
+                } else {
+                    lastErr = err2
+                }
                 relSF()
             }
         }
-        return false, "", "", ""
+        if lastErr == nil { lastErr = fmt.Errorf("fast models unavailable for job %s page %d", jobID, pageID) }
+        return false, "", "", "", lastErr
     }
 
     // Try primary provider primary model
@@ -250,8 +281,14 @@ func (w *Worker) processPage(ctx context.Context, jobID string, pageID int, cont
         if ok {
             resp, err = call(primaryProv, pModel)
             rel()
-            if err == nil { w.lim.Close(ctx, primaryProv, pModel); mpkg.BreakerClosed(primaryProv, pModel); return true, primaryProv, pModel, resp.Text }
-            if ai.IsRateLimited(err) || isTransient(err) { w.lim.Open(ctx, primaryProv, pModel); mpkg.BreakerOpened(primaryProv, pModel) }
+            if err == nil { w.lim.Close(ctx, primaryProv, pModel); mpkg.BreakerClosed(primaryProv, pModel); return true, primaryProv, pModel, resp.Text, nil }
+            lastErr = err
+            if ai.IsRateLimited(err) || isTransient(err) {
+                w.lim.Open(ctx, primaryProv, pModel)
+                mpkg.BreakerOpened(primaryProv, pModel)
+                log.Warn().Str("job_id", jobID).Int("page_id", pageID).Str("provider", primaryProv).
+                    Str("model", pModel).Err(err).Msg("primary model hit limiter; opening circuit")
+            }
         }
     }
 
@@ -260,7 +297,11 @@ func (w *Worker) processPage(ctx context.Context, jobID string, pageID int, cont
         if !w.lim.IsOpen(ctx, primaryProv, sModel) {
             rel2, ok2 := w.lim.Allow(primaryProv, sModel)
             if ok2 {
-                if resp2, err2 := call(primaryProv, sModel); err2 == nil { rel2(); w.lim.Close(ctx, primaryProv, sModel); mpkg.BreakerClosed(primaryProv, sModel); return true, primaryProv, sModel, resp2.Text }
+                if resp2, err2 := call(primaryProv, sModel); err2 == nil {
+                    rel2(); w.lim.Close(ctx, primaryProv, sModel); mpkg.BreakerClosed(primaryProv, sModel); return true, primaryProv, sModel, resp2.Text, nil
+                } else {
+                    lastErr = err2
+                }
                 rel2()
             }
         }
@@ -271,21 +312,31 @@ func (w *Worker) processPage(ctx context.Context, jobID string, pageID int, cont
     if !w.lim.IsOpen(ctx, secondaryProv, spModel) {
         rel3, ok3 := w.lim.Allow(secondaryProv, spModel)
         if ok3 {
-            if resp3, err2 := call(secondaryProv, spModel); err2 == nil { rel3(); w.lim.Close(ctx, secondaryProv, spModel); mpkg.BreakerClosed(secondaryProv, spModel); return true, secondaryProv, spModel, resp3.Text }
+            if resp3, err2 := call(secondaryProv, spModel); err2 == nil {
+                rel3(); w.lim.Close(ctx, secondaryProv, spModel); mpkg.BreakerClosed(secondaryProv, spModel); return true, secondaryProv, spModel, resp3.Text, nil
+            } else {
+                lastErr = err2
+            }
             rel3()
             if ai.IsRateLimited(err) || isTransient(err) {
                 ssModel := w.secondaryModel(secondaryProv)
                 if ssModel != "" && !w.lim.IsOpen(ctx, secondaryProv, ssModel) {
                     rel4, ok4 := w.lim.Allow(secondaryProv, ssModel)
                     if ok4 {
-                        if resp4, err4 := call(secondaryProv, ssModel); err4 == nil { rel4(); w.lim.Close(ctx, secondaryProv, ssModel); mpkg.BreakerClosed(secondaryProv, ssModel); return true, secondaryProv, ssModel, resp4.Text }
+                        if resp4, err4 := call(secondaryProv, ssModel); err4 == nil {
+                            rel4(); w.lim.Close(ctx, secondaryProv, ssModel); mpkg.BreakerClosed(secondaryProv, ssModel); return true, secondaryProv, ssModel, resp4.Text, nil
+                        } else {
+                            lastErr = err4
+                        }
                         rel4()
                     }
                 }
             }
         }
     }
-    return false, "", "", ""
+    if lastErr == nil { lastErr = err }
+    if lastErr == nil { lastErr = fmt.Errorf("no provider succeeded for job %s page %d", jobID, pageID) }
+    return false, "", "", "", lastErr
 }
 
 func (w *Worker) primaryModel(provider string) string {

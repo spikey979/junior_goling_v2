@@ -2,6 +2,7 @@ package web
 
 import (
     "bytes"
+    "context"
     "encoding/json"
     "fmt"
     "html/template"
@@ -11,6 +12,9 @@ import (
     "os"
     "path/filepath"
     "strings"
+    "time"
+
+    "github.com/local/aidispatcher/internal/statuscheck"
 )
 
 type Web struct {
@@ -18,9 +22,10 @@ type Web struct {
     username  string
     password  string
     port      string
+    status    *statuscheck.Checker
 }
 
-func New() *Web {
+func New(status *statuscheck.Checker) *Web {
     // load templates
     tpl := template.Must(template.ParseGlob(filepath.Join("web", "templates", "*.html")))
     return &Web{
@@ -28,6 +33,7 @@ func New() *Web {
         username: os.Getenv("WEB_USERNAME"),
         password: os.Getenv("WEB_PASSWORD"),
         port:     getenv("PORT", "8080"),
+        status:   status,
     }
 }
 
@@ -39,6 +45,7 @@ func (w *Web) RegisterRoutes(mux *http.ServeMux) {
     mux.HandleFunc("/web/process", w.requireAuth(w.handleProcess))
     mux.HandleFunc("/web/upload", w.requireAuth(w.handleUpload))
     mux.HandleFunc("/web/progress/", w.requireAuth(w.handleProgress))
+    mux.HandleFunc("/web/system_status", w.requireAuth(w.handleSystemStatus))
 }
 
 func (w *Web) render(wr http.ResponseWriter, name string, data any) {
@@ -149,6 +156,24 @@ func (w *Web) handleProgress(wr http.ResponseWriter, r *http.Request) {
     defer resp.Body.Close()
     wr.Header().Set("Content-Type", "application/json")
     io.Copy(wr, resp.Body)
+}
+
+func (w *Web) handleSystemStatus(wr http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        wr.WriteHeader(http.StatusMethodNotAllowed)
+        return
+    }
+    if w.status == nil {
+        http.Error(wr, "status checker not configured", http.StatusServiceUnavailable)
+        return
+    }
+    ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
+    defer cancel()
+    summary := w.status.Summary(ctx)
+    wr.Header().Set("Content-Type", "application/json")
+    enc := json.NewEncoder(wr)
+    enc.SetIndent("", "")
+    _ = enc.Encode(summary)
 }
 
 func getenv(k, d string) string { if v := os.Getenv(k); v != "" { return v }; return d }
