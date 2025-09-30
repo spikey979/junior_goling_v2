@@ -1,0 +1,27 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aidispatcher
+    environment:
+      - TZ=Europe/Sarajevo
+      - PORT=8080
+      - REDIS_URL=redis://redis:6379
+      - RUN_DISPATCHER=1
+      - LOG_FILE=logs/aidispathcher.log
+      - LOG_LEVEL=debug
+      - LOG_PRETTY=true
+      - WEB_USERNAME=admin
+      - WEB_PASSWORD=changeme
+    depends_on:
+      - redis
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped

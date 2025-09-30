@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Login</title>
+  <style>
+    body { font-family: sans-serif; max-width: 480px; margin: 60px auto; }
+    form { display: grid; gap: 12px; }
+    input { padding: 8px; }
+    .error { color: #b00; }
+  </style>
+  </head>
+<body>
+  <h1>AI Orchestrator – Prijava</h1>
+  {{ if .Error }}<p class="error">{{ .Error }}</p>{{ end }}
+  <form method="post">
+    <label>Korisničko ime <input type="text" name="username" /></label>
+    <label>Lozinka <input type="password" name="password" /></label>
+    <button type="submit">Prijavi se</button>
+  </form>
+</body>
+</html>
+

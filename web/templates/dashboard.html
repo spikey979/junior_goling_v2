@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>AI Orchestrator – Dashboard</title>
+  <style>
+    body { font-family: sans-serif; margin: 24px; }
+    header { display:flex; justify-content: space-between; align-items:center; }
+    main { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+    form { display:grid; gap:10px; border:1px solid #ddd; padding:16px; border-radius:8px; }
+    input, select { padding:8px; }
+    pre { background:#f8f8f8; padding:12px; border-radius:6px; }
+  </style>
+  </head>
+<body>
+  <header>
+    <h1>AI Orchestrator – Dashboard</h1>
+    <nav>
+      <a href="/web/logout">Logout</a>
+    </nav>
+  </header>
+  <main>
+    <section>
+      <h2>Pokreni obradu</h2>
+      <form method="post" action="/web/process">
+        <label>File path/URL (S3 ključ ili s3://)
+          <input name="file_path" placeholder="s3://bucket/key.pdf" />
+        </label>
+        <label>Korisnik
+          <input name="user_name" placeholder="user@example.com" />
+        </label>
+        <label>AI engine
+          <select name="ai_engine">
+            <option value="OpenAIEngine">OpenAIEngine</option>
+            <option value="ClaudeEngine">ClaudeEngine</option>
+            <option value="JuniorEngine">JuniorEngine</option>
+          </select>
+        </label>
+        <label>
+          <input type="checkbox" name="text_only" /> Samo MuPDF (bez AI)
+        </label>
+        <button type="submit">Procesiraj</button>
+      </form>
+      <p>Rezultat poziva bit će prikazan kao JSON odgovor.</p>
+    </section>
+    <section>
+      <h2>Praćenje</h2>
+      <form onsubmit="ev(event)">
+        <label>Job ID <input id="jid" /></label>
+        <button>Provjeri</button>
+      </form>
+      <pre id="out">(nema podataka)</pre>
+    </section>
+  </main>
+  <script>
+    async function ev(e){
+      e.preventDefault();
+      const jid = document.getElementById('jid').value;
+      const r = await fetch('/progress_spec/'+jid);
+      const t = await r.text();
+      document.getElementById('out').textContent = t;
+    }
+  </script>
+</body>
+</html>
+
