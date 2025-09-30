@@ -8,7 +8,6 @@ import (
     "fmt"
     "net/http"
     "os"
-    "time"
 )
 
 type OpenAIClient struct{

@@ -319,6 +319,11 @@ for msg := range stream.ConsumerGroup("jobs:ai:pages", "workers:images") {
   - Preimenovan pipeline naziv u "Goling" (umjesto "Bart") kroz dokumentaciju
   - Dodan orchestrator cleanup `CleanupTemps(1h)` i skripta `scripts/cleanup_tmp.sh` (za cron, briše `pdfdl-*.pdf` i `s3pdf-*.pdf` starije od 1h)
   - Dashboard endpoint `/web/process` koristi isti Goling pipeline (proxy na API) – bez dupliranja logike
+  - Dodan `.env` template s varijablama i prilagođen `docker-compose.yml` (env_file + mount `${HOME}/.aws` i `AWS_SDK_LOAD_CONFIG=1`)
+  - Dodana skripta `scripts/ensure_redis.sh` – provjerava lokalni Redis i po potrebi pokreće docker `redis:7-alpine`
+  - Dodan `.env.example` s komentarima za sve varijable (brzo popunjavanje lokalnih vrijednosti)
+  - Compose: uklonjen host port mapping za Redis (koristi se unutarnji DNS `redis`) da se izbjegnu konflikti porta 6379
+  - Compose: `app` host port parametriziran preko `HOST_PORT` (default 8080) radi izbjegavanja konflikata
 - [x] Dispatcher fallback:
   - Proširen multi‑model fallback: unutar providera pokušava i sekundarni model i na transient greškama (ne samo 429)
   - Dodana fast‑model ruta kada payload sadrži `force_fast=true` (pokušaj fast modela primarnog pa sekundarnog providera)

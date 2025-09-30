@@ -1,27 +1,29 @@
 services:
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
   app:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: aidispatcher
+    # .env will be mounted as a file for hot-reload
     environment:
       - TZ=Europe/Sarajevo
-      - PORT=8080
-      - REDIS_URL=redis://redis:6379
-      - RUN_DISPATCHER=1
-      - LOG_FILE=logs/aidispathcher.log
-      - LOG_LEVEL=debug
-      - LOG_PRETTY=true
-      - WEB_USERNAME=admin
-      - WEB_PASSWORD=changeme
+      - AWS_SDK_LOAD_CONFIG=1
     depends_on:
       - redis
     ports:
-      - "8080:8080"
+      - "${HOST_PORT:-8080}:8080"
     volumes:
       - ./logs:/app/logs
+      - ./web:/app/web
+      - ./bin:/app/bin
+      - ./.env:/app/.env:ro
+      - ${HOME}/.aws:/root/.aws:ro
     restart: unless-stopped
+  builder:
+    image: golang:1.25-bookworm
+    working_dir: /app
+    volumes:
+      - ./:/app
+    entrypoint: ["bash","-lc","sleep infinity"]

@@ -3,8 +3,6 @@ package orchestrator
 import (
     "context"
     "fmt"
-    "io"
-    "net/http"
     "os"
     "strings"
 
@@ -47,17 +45,4 @@ func ensureLocalPDF(ctx context.Context, ref string) (string, string, error) {
     }
 }
 
-// duplicate lightweight HTTP downloader to avoid cross-file export
-func downloadHTTPToTemp(ctx context.Context, url string) (string, error) {
-    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-    resp, err := http.DefaultClient.Do(req)
-    if err != nil { return "", err }
-    defer resp.Body.Close()
-    if resp.StatusCode != 200 { return "", fmt.Errorf("http %d", resp.StatusCode) }
-    f, err := os.CreateTemp("", "pdfdl-*.pdf")
-    if err != nil { return "", err }
-    defer f.Close()
-    if _, err := io.Copy(f, resp.Body); err != nil { return "", err }
-    return f.Name(), nil
-}
-
+// downloadHTTPToTemp provided in pagecount.go within same package

@@ -8,10 +8,8 @@ import (
     "os"
     "path/filepath"
     "strings"
-    "time"
 
     "github.com/pdfcpu/pdfcpu/pkg/api"
-    "github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
     "github.com/rs/zerolog/log"
 
     awscfg "github.com/aws/aws-sdk-go-v2/config"
@@ -53,8 +51,7 @@ func DetermineTotalPages(ctx context.Context, ref string) (int, error) {
         defer os.Remove(tmpToRemove)
     }
 
-    conf := pdfcpu.NewDefaultConfiguration()
-    n, err := api.PageCountFile(localPath, conf)
+    n, err := api.PageCountFile(localPath)
     if err != nil {
         return 0, fmt.Errorf("pdf page count failed: %w", err)
     }
@@ -99,4 +96,3 @@ func downloadS3ToTemp(ctx context.Context, s3url string) (string, error) {
     log.Info().Str("bucket", bucket).Str("key", key).Str("file", filepath.Base(f.Name())).Msg("downloaded s3 pdf to temp")
     return f.Name(), nil
 }
-
