@@ -72,9 +72,12 @@
     .upload-section:hover { border-color: var(--primary-color); transform: translateY(-1px); box-shadow: var(--shadow-sm); }
     .upload-icon { font-size: 2rem; opacity: 0.8; margin-bottom: .5rem; }
     .upload-text { color: var(--text-muted); margin-bottom: .75rem; }
+    .upload-supported { color: var(--text-muted); font-size: .85rem; margin-bottom: .75rem; }
     .file-input { display: none; }
     .file-input-label { background: var(--primary-gradient); color: #fff; padding: .6rem 1.25rem; border-radius: var(--radius-sm); cursor: pointer; font-weight: 600; box-shadow: var(--shadow-sm); display: inline-block; }
     .file-input-label:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); }
+    .file-selected { margin-top: .5rem; color: var(--text-muted); font-size: .9rem; }
+    .error-msg { margin-top: .5rem; color: #b91c1c; font-weight: 600; }
   </style>
   </head>
 <body>
@@ -101,12 +104,15 @@
             <label for="user_name">User</label>
             <input id="user_name" name="user_name" placeholder="user@example.com" />
           </div>
-          <!-- Drag & Drop Upload (UI only) -->
+          <!-- Drag & Drop Upload (UI + delayed submit on Process) -->
           <div class="upload-section" aria-label="Upload file">
             <div class="upload-icon">📤</div>
             <div class="upload-text">Drag & drop a file here</div>
-            <input type="file" id="file_input" class="file-input" />
+            <div class="upload-supported">Supported: pdf, docx, pptx, vsdx, doc, ppt, txt</div>
+            <input type="file" id="file_input" name="file" class="file-input" accept=".pdf,.docx,.pptx,.vsdx,.doc,.ppt,.txt" />
             <label for="file_input" class="file-input-label">Choose File</label>
+            <div id="file_selected" class="file-selected" aria-live="polite"></div>
+            <div id="file_error" class="error-msg" style="display:none;"></div>
           </div>
           <div class="form-group">
             <label for="ai_engine">AI engine</label>
@@ -119,7 +125,7 @@
           <label class="checkbox">
             <input type="checkbox" name="text_only" /> MuPDF only (no AI)
           </label>
-          <button class="btn btn-primary" type="submit">Process</button>
+          <button id="processBtn" class="btn btn-primary" type="submit">Process</button>
         </form>
         <p class="helper">The call result will be shown as JSON.</p>
       </div>
@@ -202,6 +208,79 @@
       const t = await r.text();
       document.getElementById('out').textContent = t;
     }
+    // Upload selection and guarded submit
+    (function(){
+      const allowed = [".pdf",".docx",".pptx",".vsdx",".doc",".ppt",".txt"]; 
+      const uploadBox = document.querySelector('.upload-section');
+      const fileInput = document.getElementById('file_input');
+      const fileSelected = document.getElementById('file_selected');
+      const fileError = document.getElementById('file_error');
+      const form = document.querySelector('form.form');
+      const outPre = document.getElementById('out');
+      const jidInput = document.getElementById('jid');
+      let selectedFile = null;
+
+      function extOK(name){
+        const lower = (name||'').toLowerCase();
+        return allowed.some(e => lower.endsWith(e));
+      }
+      function showSelected(file){
+        fileSelected.textContent = file ? `Selected: ${file.name} (${Math.round(file.size/1024)} KB)` : '';
+      }
+      function showError(msg){
+        if(!msg){ fileError.style.display='none'; fileError.textContent=''; return; }
+        fileError.style.display='block'; fileError.textContent = msg;
+      }
+
+      // Drag & drop
+      ['dragenter','dragover'].forEach(evName=>{
+        uploadBox.addEventListener(evName, (e)=>{ e.preventDefault(); e.stopPropagation(); uploadBox.classList.add('dragover'); });
+      });
+      ['dragleave','drop'].forEach(evName=>{
+        uploadBox.addEventListener(evName, (e)=>{ e.preventDefault(); e.stopPropagation(); uploadBox.classList.remove('dragover'); });
+      });
+      uploadBox.addEventListener('drop', (e)=>{
+        const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+        if(!f) return;
+        if(!extOK(f.name)) { showError('Unsupported file type. Allowed: ' + allowed.join(', ')); return; }
+        selectedFile = f; showSelected(f); showError('');
+        // also reflect into input for consistency
+        const dt = new DataTransfer(); dt.items.add(f); fileInput.files = dt.files;
+      });
+
+      // Choose file
+      fileInput.addEventListener('change', ()=>{
+        const f = fileInput.files && fileInput.files[0];
+        if(!f) { selectedFile=null; showSelected(null); return; }
+        if(!extOK(f.name)) { selectedFile=null; showSelected(null); showError('Unsupported file type. Allowed: ' + allowed.join(', ')); fileInput.value=''; return; }
+        selectedFile = f; showSelected(f); showError('');
+      });
+
+      // Intercept submit: require file, then POST to /web/upload
+      form.addEventListener('submit', async (e)=>{
+        e.preventDefault();
+        if(!selectedFile){ showError('Please choose a file before processing.'); return; }
+        const btn = document.getElementById('processBtn');
+        btn.disabled = true;
+        try {
+          const fd = new FormData();
+          fd.append('file', selectedFile);
+          fd.append('user_name', document.getElementById('user_name').value || '');
+          fd.append('ai_engine', document.getElementById('ai_engine').value || '');
+          const textOnly = form.querySelector('input[name="text_only"]').checked;
+          fd.append('text_only', textOnly ? 'true' : 'false');
+
+          const resp = await fetch('/web/upload', { method: 'POST', body: fd });
+          const txt = await resp.text();
+          outPre.textContent = txt;
+          try { const js = JSON.parse(txt); if(js && js.job_id){ jidInput.value = js.job_id; } } catch {}
+        } catch (err) {
+          showError('Upload failed: ' + (err && err.message ? err.message : String(err)));
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    })();
   </script>
 </body>
 </html>

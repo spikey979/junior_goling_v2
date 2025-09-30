@@ -169,6 +169,9 @@ Ovaj dokument definira arhitekturu, pravila i korake implementacije servisa za o
   - (Opcionalno) lokalni paralelizam po modelu: `MAX_INFLIGHT_OPENAI_GPT41=4`, `MAX_INFLIGHT_OPENAI_GPT4O=4`, ...
 - Storage/queue:
   - `REDIS_URL=redis://...`, `RESULT_STORE=postgres|s3`, `FILES_BASE=file:///mnt/docs`
+  - Upload/Local results:
+    - `UPLOAD_DIR` (default `./uploads`)
+    - `RESULT_DIR` (default `./uploads/results`)
 
 ## Docker Compose (skica)
 ```yaml
@@ -207,6 +210,7 @@ services:
 - `internal/ai/openai.go`, `internal/ai/anthropic.go` – provider implementacije.
 - `internal/worker/worker.go` – orchestracija pokušaja, timeouti, idempotency, metrika hookovi.
 - `internal/model/types.go` – `Job`, `Result`, `Usage`, error klasifikacija.
+- `internal/orchestrator/localsave.go` – lokalno spremanje agregiranog teksta za upload poslove.
 
 ## Pseudokôd: worker loop i failover
 ```go
@@ -351,6 +355,24 @@ for msg := range stream.ConsumerGroup("jobs:ai:pages", "workers:images") {
 - [ ] Axiom: dodati strukturirana polja (job_id, provider, model, attempt, duration).
 - [x] Health i metrics: dodati `/metrics` (Prometheus) i osnovne metrike (provider requests, latencije, retry/DLQ, depth)
 
+## Ažuriranja 2025-09-30 (UI + Upload flow)
+- Orchestrator:
+  - Dodan POST guard na `POST /process_file_junior_call` (samo POST).
+  - Novi endpoint `POST /process_file_upload` (multipart) – dashboard upload bez S3; spremanje lokalno (`UPLOAD_DIR`) i enqueue u isti worker pipeline.
+  - Novi endpoint `GET /download_result/{job_id}` – download agregiranog rezultata za poslove s izvorom `upload`.
+  - Agregacija rezultata: za `source=upload` sprema lokalno (`RESULT_DIR`) preko `SaveAggregatedTextToLocal`; za ostalo i dalje S3 (`SaveAggregatedTextToS3`).
+- Web (dashboard):
+  - Novi proxy endpoint `POST /web/upload` koji prosljeđuje na `/process_file_upload`.
+  - UI: dodan drag&drop upload, filtriranje ekstenzija, tekst “Supported: pdf, docx, pptx, vsdx, doc, ppt, txt”, odgođeno slanje do klika na Process, bez obrade bez fajla.
+  - Branding/UI: sve label‑e prevedene na engleski; naziv sustava “FileApi”.
+- ENV:
+  - `UPLOAD_DIR` (default `./uploads`), `RESULT_DIR` (default `./uploads/results`).
+
+Open TODOs za ovaj dio:
+- Dashboard: dodati “Download result” gumb kad je `status=success` i `source=upload` (zove `/download_result/{job_id}`).
+- Validacije: tip i veličina fajla (client+server), cleanup upload direktorija, rate‑limit upload endpointa.
+- Metrike: broj upload poslova, veličina upload‑ova, trajanje upload pipelinea.
+
 ---
 
 Napomena: Binarne datoteke ne stavljati u Redis. Koristiti samo reference (lokalni `file://` ili objektna pohrana poput S3) i hash za integritet.
@@ -360,13 +382,16 @@ Napomena: Binarne datoteke ne stavljati u Redis. Koristiti samo reference (lokal
 Ovaj odjeljak definira hibridni Orchestrator koji prima zahtjeve od GhostServer‑a (POST `/process_file_junior_call`), odlučuje koje stranice obraditi lokalno (MuPDF) a koje preko AI Dispatchera, ažurira progres i pohranjuje rezultate. Orchestrator i Dispatcher rade u istom servisu, ali su jasno odvojeni paketi/binariji za kasniji split.
 
 ### API Endpoints
-- POST `/process_file_junior_call`: prihvaća zahtjev za obradu jednog dokumenta (pipeline: Goling).
-- POST `/web/process`: dashboard endpoint koji poziva isti Goling pipeline (proxy prema API‑ju uz basic auth), bez dupliranja logike.
+- POST `/process_file_junior_call`: prihvaća zahtjev za obradu jednog dokumenta (pipeline preko S3/URL reference).
+- POST `/process_file_upload`: dashboard upload (multipart) – spremi lokalno (UPLOAD_DIR) i enqueuea kroz isti worker pipeline (bez S3 I/O).
+- GET `/download_result/{job_id}`: vraća agregirani rezultat kao datoteku za poslove s izvorom `upload`.
+- POST `/web/process`: dashboard endpoint – proxy prema `/process_file_junior_call` (JSON request bez file‑a).
+- POST `/web/upload`: dashboard endpoint – proxy prema `/process_file_upload` (multipart upload).
 - GET `/progress_spec/{job_id_or_file_id}`: vraća status i progres obrade.
 - GET `/health`, `/health_check`, `/status`: healthz.
- - POST `/webhook/cancel_job`: otkazivanje posla; zapis u Redis cancel set i ažuriranje statusa.
- - POST `/internal/page_done?job_id=&page_id=`: dispatcher šalje završenu AI stranicu (body: `{text,provider,model}`).
- - POST `/internal/page_failed?job_id=&page_id=`: dispatcher označi stranicu kao fail (orchestrator radi MuPDF fallback).
+- POST `/webhook/cancel_job`: otkazivanje posla; zapis u Redis cancel set i ažuriranje statusa.
+- POST `/internal/page_done?job_id=&page_id=`: dispatcher šalje završenu AI stranicu (body: `{text,provider,model}`).
+- POST `/internal/page_failed?job_id=&page_id=`: dispatcher označi stranicu kao fail (orchestrator radi MuPDF fallback).
 
 ### Request schema (usklađeno s postojećim kodom)
 - Polja (GhostServer + legacy):
@@ -403,6 +428,14 @@ Ovaj odjeljak definira hibridni Orchestrator koji prima zahtjeve od GhostServer�
    - Ako Orchestrator zahtijeva „fast” model, postaviti `force_fast=true` u payload.
 5. Paralelno (lokalno) procesuirati MuPDF stranice; rezultati idu u privremenu pohranu.
 6. Agregacija: čekati AI rezultate (poll/push), objediniti s MuPDF rezultatima u finalni tekst i zapisati u S3 (bez lokalne baze). Status metadata: `result_s3_url`, `result_text_len`.
+
+### Tok za POST /process_file_upload (dashboard upload)
+1. Validacija multipart zahtjeva i polja `file`, `user_name`, `ai_engine`, `text_only`.
+2. Spremanje datoteke lokalno u `UPLOAD_DIR` (default `./uploads`) i generiranje `file://` reference; `status.Metadata.source = "upload"` i `status.Metadata.file_local`.
+3. Brojanje stranica i selekcija (isti selektor kao i S3/URL put).
+4. Enqueue AI stranica u isti Redis Stream (`jobs:ai:pages`) – worker pipeline je identičan.
+5. Agregacija: objediniti rezultate i, za upload poslove, spremiti agregirani tekst lokalno (`RESULT_DIR`, default `./uploads/results`). U status dodati `result_local_path` i `result_text_len` te označiti `success`.
+6. Dashboard može preuzeti rezultat preko `GET /download_result/{job_id}`.
 
 ## Pokretanje servisa (Docker Compose)
 - Preduvjeti:
@@ -463,6 +496,12 @@ Ovaj odjeljak definira hibridni Orchestrator koji prima zahtjeve od GhostServer�
 - `internal/store/status_redis.go`: Redis status store; `internal/store/page_redis.go`: per‑stranica tekst i agregacija.
 - `internal/ai/*`: klijenti za OpenAI i Anthropic (HTTP pozivi, 429 mapiranje).
 - `internal/logger/logger.go`: file rotacija + Axiom; `internal/config/env.go`: centralni config.
+  
+### UI/Dashboard (promjene)
+- Dashboard preuređen i preveden na engleski (branding: FileApi); dodan desni stupac s "System Status" i "Live Metrics" (placeholderi).
+- Dodan drag‑and‑drop okvir s "Choose File" (UI samo), prikaz odabranog naziva/veličine i popis podržanih formata: `pdf, docx, pptx, vsdx, doc, ppt, txt`.
+- Prihvaćeni tipovi ograničeni putem `accept=".pdf,.docx,.pptx,.vsdx,.doc,.ppt,.txt"`.
+- Klik na "Process" tek tada šalje upload na `/web/upload` (nema obrade bez odabranog fajla). Odgovor prikazan u Monitoring pre‑bloku i auto‑popunjava `job_id` polje.
 7. Ažurirati Redis status: `processing` → `success` ili `failed` + poruka. Emitirati progres (0–100%) po milestoneovima: preuzimanje, analiza, enqueuing AI, završetak MuPDF, pristizanje AI rezultata, spajanje, spremanje.
 
 ### Progres i status

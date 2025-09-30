@@ -4,6 +4,7 @@ import (
     "context"
     "encoding/json"
     "fmt"
+    "io"
     "net/http"
     "os"
     "strings"
@@ -55,7 +56,9 @@ type PageStore interface {
 func (o *Orchestrator) RegisterRoutes(mux *http.ServeMux) {
     mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request){ w.WriteHeader(http.StatusOK); _,_ = w.Write([]byte("ok")) })
     mux.HandleFunc("/process_file_junior_call", o.handleProcess)
+    mux.HandleFunc("/process_file_upload", o.handleProcessUpload)
     mux.HandleFunc("/progress_spec/", o.handleProgress)
+    mux.HandleFunc("/download_result/", o.handleDownloadResult)
     mux.HandleFunc("/internal/job_done", o.handleJobDone)
     mux.HandleFunc("/webhook/cancel_job", o.handleCancelJob)
     mux.HandleFunc("/internal/page_done", o.handlePageDone)
@@ -86,6 +89,9 @@ type processResp struct {
 }
 
 func (o *Orchestrator) handleProcess(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        w.WriteHeader(http.StatusMethodNotAllowed); return
+    }
     defer r.Body.Close()
     var req processReq
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -170,6 +176,94 @@ func (o *Orchestrator) handleProcess(w http.ResponseWriter, r *http.Request) {
     _ = json.NewEncoder(w).Encode(resp)
 }
 
+// handleProcessUpload accepts multipart/form-data uploads from dashboard and enqueues work.
+// It mirrors the /process_file_junior_call flow but skips S3 usage entirely.
+func (o *Orchestrator) handleProcessUpload(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost { w.WriteHeader(http.StatusMethodNotAllowed); return }
+    // Expect multipart with fields: file (required), user_name, ai_engine, text_only
+    if err := r.ParseMultipartForm(64 << 20); err != nil { // 64MB max memory before temp files
+        http.Error(w, "invalid multipart form", http.StatusBadRequest); return
+    }
+    file, hdr, err := r.FormFile("file")
+    if err != nil { http.Error(w, "missing file", http.StatusBadRequest); return }
+    defer file.Close()
+    user := r.FormValue("user_name")
+    if user == "" { http.Error(w, "missing user_name", http.StatusBadRequest); return }
+    aiEngine := r.FormValue("ai_engine")
+    textOnly := r.FormValue("text_only") == "on" || r.FormValue("text_only") == "true"
+
+    // Persist upload to local storage
+    uploadDir := os.Getenv("UPLOAD_DIR")
+    if uploadDir == "" { uploadDir = "uploads" }
+    if err := os.MkdirAll(uploadDir, 0o755); err != nil { http.Error(w, "cannot create upload dir", 500); return }
+    jobID := uuid.NewString()
+    // derive filename with job prefix to avoid collisions
+    name := hdr.Filename
+    if name == "" { name = "upload.pdf" }
+    localPath := fmt.Sprintf("%s/%s_%s", strings.TrimRight(uploadDir, "/"), jobID, name)
+    out, err := os.Create(localPath)
+    if err != nil { http.Error(w, "cannot save upload", 500); return }
+    if _, err := io.Copy(out, file); err != nil { out.Close(); http.Error(w, "write failed", 500); return }
+    _ = out.Close()
+
+    // Initialize status
+    start := time.Now()
+    _ = o.deps.Status.Set(r.Context(), jobID, Status{Status: "queued", Progress: 0, Message: "queued",
+        Start: &start, Metadata: map[string]any{"file_local": localPath, "user": user, "source": "upload"}})
+
+    // Page count and selection
+    fileRef := "file://" + localPath
+    pages, err := DetermineTotalPages(r.Context(), fileRef)
+    if err != nil { pages = 1 }
+    sel := SelectPages(SelectionOptions{TextOnly: textOnly, TotalPages: pages})
+
+    // Enqueue AI pages
+    for _, p := range sel.AIPages {
+        payload := map[string]any{
+            "job_id": jobID,
+            "file_path": fileRef,
+            "page_id": p,
+            "content_ref": fmt.Sprintf("%s#page=%d", fileRef, p),
+            "user": user,
+            "ai_engine": aiEngine,
+            "text_only": textOnly,
+            "source": "upload",
+            "idempotency_key": fmt.Sprintf("doc:%s:page:%d", jobID, p),
+            "attempt": 1,
+        }
+        data, _ := json.Marshal(payload)
+        if err := o.deps.Queue.EnqueueAI(r.Context(), data); err != nil {
+            http.Error(w, "queue unavailable", http.StatusServiceUnavailable); return
+        }
+    }
+
+    _ = o.deps.Status.Set(r.Context(), jobID, Status{Status: "processing", Progress: 10,
+        Message: "enqueued AI pages", Metadata: map[string]any{"total_pages": pages, "ai_pages": len(sel.AIPages), "mupdf_pages": len(sel.MuPDFPages), "pages_done": 0, "pages_failed": 0, "file_local": localPath, "source": "upload"}})
+
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusCreated)
+    _ = json.NewEncoder(w).Encode(processResp{Status: "ok", JobID: jobID, Message: "Upload job created"})
+}
+
+// handleDownloadResult serves the aggregated text for upload-origin jobs as a file download.
+func (o *Orchestrator) handleDownloadResult(w http.ResponseWriter, r *http.Request) {
+    id := strings.TrimPrefix(r.URL.Path, "/download_result/")
+    st, ok, err := o.deps.Status.Get(r.Context(), id)
+    if err != nil || !ok { http.Error(w, "not found", http.StatusNotFound); return }
+    if st.Status != "success" { http.Error(w, "not ready", http.StatusAccepted); return }
+    // Only for upload-origin jobs
+    if st.Metadata == nil || st.Metadata["source"] != "upload" {
+        http.Error(w, "not an upload job", http.StatusBadRequest); return
+    }
+    p, _ := st.Metadata["result_local_path"].(string)
+    if p == "" { http.Error(w, "result not available", http.StatusNotFound); return }
+    b, err := os.ReadFile(p)
+    if err != nil { http.Error(w, "failed to read", 500); return }
+    w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+    w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=extracted_text_%s.txt", id))
+    w.Write(b)
+}
+
 func (o *Orchestrator) handleProgress(w http.ResponseWriter, r *http.Request) {
     id := strings.TrimPrefix(r.URL.Path, "/progress_spec/")
     st, ok, err := o.deps.Status.Get(r.Context(), id)
@@ -233,10 +327,17 @@ func (o *Orchestrator) handlePageDone(w http.ResponseWriter, r *http.Request) {
         agg, _ := o.deps.Pages.AggregateText(r.Context(), jobID, total)
         if st.Metadata == nil { st.Metadata = map[string]any{} }
         st.Metadata["result_text_len"] = len(agg)
-        // Save to S3
-        filePath, _ := st.Metadata["file_path"].(string)
-        if s3url, err := SaveAggregatedTextToS3(r.Context(), filePath, jobID, agg); err == nil {
-            st.Metadata["result_s3_url"] = s3url
+        // Save result depending on source
+        if src, _ := st.Metadata["source"].(string); src == "upload" {
+            if localPath, err := SaveAggregatedTextToLocal(r.Context(), jobID, agg); err == nil {
+                st.Metadata["result_local_path"] = localPath
+            }
+        } else {
+            // Save to S3
+            filePath, _ := st.Metadata["file_path"].(string)
+            if s3url, err := SaveAggregatedTextToS3(r.Context(), filePath, jobID, agg); err == nil {
+                st.Metadata["result_s3_url"] = s3url
+            }
         }
         st.Status = "success"
         st.Progress = 100
@@ -273,10 +374,16 @@ func (o *Orchestrator) handlePageFailed(w http.ResponseWriter, r *http.Request) 
     if total > 0 && done+failed >= total {
         agg, _ := o.deps.Pages.AggregateText(r.Context(), jobID, total)
         st.Metadata["result_text_len"] = len(agg)
-        // Save to S3
-        filePath, _ := st.Metadata["file_path"].(string)
-        if s3url, err := SaveAggregatedTextToS3(r.Context(), filePath, jobID, agg); err == nil {
-            st.Metadata["result_s3_url"] = s3url
+        // Save result depending on source
+        if src, _ := st.Metadata["source"].(string); src == "upload" {
+            if localPath, err := SaveAggregatedTextToLocal(r.Context(), jobID, agg); err == nil {
+                st.Metadata["result_local_path"] = localPath
+            }
+        } else {
+            filePath, _ := st.Metadata["file_path"].(string)
+            if s3url, err := SaveAggregatedTextToS3(r.Context(), filePath, jobID, agg); err == nil {
+                st.Metadata["result_s3_url"] = s3url
+            }
         }
         st.Status = "success"
         st.Progress = 100
