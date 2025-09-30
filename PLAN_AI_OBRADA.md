@@ -324,6 +324,10 @@ for msg := range stream.ConsumerGroup("jobs:ai:pages", "workers:images") {
   - Dodan `.env.example` s komentarima za sve varijable (brzo popunjavanje lokalnih vrijednosti)
   - Compose: uklonjen host port mapping za Redis (koristi se unutarnji DNS `redis`) da se izbjegnu konflikti porta 6379
   - Compose: `app` host port parametriziran preko `HOST_PORT` (default 8080) radi izbjegavanja konflikata
+  - Dev hot‑reload: dodan dev entrypoint (`/app/dev_entrypoint.sh`) koji prati promjene u `web/templates` i `.env` te restartira servis uz re‑source env‑a
+  - Hot‑reload mountovi: `./web:/app/web`, `./.env:/app/.env:ro`, `./bin:/app/bin` (binarni se učitava iz volume‑a)
+  - Builder servis + skripta: `builder` (golang:bookworm) i `scripts/rebuild_in_container.sh` za rebuild samo binara bez rebuilda slike; nakon builda radi `docker compose restart app`
+  - Fail‑fast: ako nema binara `/app/bin/aidispatcher`, servis se ne pokreće (jasna poruka); prvi build pokrenuti preko `./scripts/rebuild_in_container.sh`
 - [x] Dispatcher fallback:
   - Proširen multi‑model fallback: unutar providera pokušava i sekundarni model i na transient greškama (ne samo 429)
   - Dodana fast‑model ruta kada payload sadrži `force_fast=true` (pokušaj fast modela primarnog pa sekundarnog providera)
@@ -411,6 +415,11 @@ Ovaj odjeljak definira hibridni Orchestrator koji prima zahtjeve od GhostServer�
   - Servisi:
     - `redis`: Redis 7 na portu 6379
     - `app`: Orchestrator+Dispatcher na portu 8080
+  - Dev hot‑reload workflow (bez rebuilda slike):
+    - Binarni: `./scripts/rebuild_in_container.sh` (builder kompajlira u `./bin/aidispatcher` i restarta `app`)
+    - Predlošci: promjene u `web/templates` se detektiraju i servis se automatski restartira
+    - `.env`: promjene u `.env` se detektiraju i env se ponovno učitava kroz dev entrypoint
+    - Napomena: bez binara (`./bin/aidispatcher`) servis fail‑fast – prvo pokrenuti rebuild skriptu
 
 - Bitne varijable (mogu se postaviti u `docker-compose.yml` ili runtime):
   - HTTP/Worker:

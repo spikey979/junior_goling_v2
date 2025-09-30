@@ -1,66 +1,207 @@
 <!DOCTYPE html>
-<html>
+<html lang="hr">
 <head>
   <meta charset="utf-8" />
-  <title>AI Orchestrator – Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FileApi – Dashboard</title>
   <style>
-    body { font-family: sans-serif; margin: 24px; }
-    header { display:flex; justify-content: space-between; align-items:center; }
-    main { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
-    form { display:grid; gap:10px; border:1px solid #ddd; padding:16px; border-radius:8px; }
-    input, select { padding:8px; }
-    pre { background:#f8f8f8; padding:12px; border-radius:6px; }
+    :root {
+      --primary-color: #2563eb;
+      --primary-gradient: linear-gradient(135deg, #2563eb 0%, #3b82f6 50%, #1d4ed8 100%);
+      --border-color: #e5e7eb;
+      --text-color: #374151;
+      --text-muted: #6b7280;
+      --card-bg: #ffffff;
+      --soft-surface: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+      --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+      --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+      --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+      --radius: 12px;
+      --radius-sm: 8px;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      background: linear-gradient(135deg, #f8fafc 0%, #eef2f7 100%);
+      color: var(--text-color);
+      line-height: 1.6;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    .header {
+      background: linear-gradient(180deg, rgba(37,99,235,0.90), rgba(37,99,235,0.80));
+      color: white;
+      padding: 0.75rem 0;
+      box-shadow: var(--shadow-lg);
+      position: sticky; top: 0; z-index: 10;
+    }
+    .header-content { max-width: 1200px; margin: 0 auto; padding: 0 1.5rem; display: flex; justify-content: space-between; align-items: center; }
+    .header h1 { font-size: 1.5rem; font-weight: 700; display: flex; align-items: center; gap: .5rem; }
+    .logout-btn { background: rgba(255,255,255,0.15); color: #fff; padding: .5rem 1rem; border-radius: 999px; text-decoration: none; transition: all .15s ease; }
+    .logout-btn:hover { background: rgba(255,255,255,0.25); transform: translateY(-1px); }
+
+    .container { max-width: 1200px; margin: 2rem auto; padding: 0 1.5rem; display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
+    @media (max-width: 900px) { .container { grid-template-columns: 1fr; } }
+    .right-col { display: grid; gap: 1.5rem; align-content: start; }
+
+    .card { background: var(--card-bg); border: 1px solid var(--border-color); border-radius: var(--radius); box-shadow: var(--shadow-sm); overflow: hidden; transition: transform .15s ease, box-shadow .15s ease; }
+    .card:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); }
+    .card-header { padding: 1rem 1.25rem; border-bottom: 1px solid var(--border-color); background: var(--soft-surface); display: flex; justify-content: space-between; align-items: center; }
+    .card-header h2 { font-size: 1.1rem; }
+    .card-body { padding: 1.25rem; }
+
+    .form { display: grid; gap: 1rem; }
+    .form-group label { display: block; margin-bottom: .4rem; color: #111827; font-weight: 600; font-size: .9rem; }
+    .form-group input, .form-group select { width: 100%; padding: .75rem 1rem; border: 2px solid var(--border-color); border-radius: var(--radius-sm); font-size: 1rem; transition: border-color .15s ease, box-shadow .15s ease; }
+    .form-group input:focus, .form-group select:focus { outline: none; border-color: var(--primary-color); box-shadow: 0 0 0 3px rgba(37,99,235,0.12); }
+    .checkbox { display: flex; align-items: center; gap: .5rem; color: var(--text-muted); }
+
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: .5rem; padding: .75rem 1.25rem; border: none; border-radius: var(--radius-sm); font-weight: 600; cursor: pointer; transition: transform .15s ease, box-shadow .15s ease; text-decoration: none; }
+    .btn-primary { background: var(--primary-gradient); color: white; box-shadow: var(--shadow-sm); }
+    .btn-primary:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); }
+
+    .helper { color: var(--text-muted); font-size: .9rem; margin-top: .5rem; }
+    pre { background: #0b1220; color: #e5e7eb; padding: 1rem; border-radius: var(--radius-sm); overflow: auto; border: 1px solid #172038; }
+
+    /* Upload (drag & drop) */
+    .upload-section { position: relative; border: 2px dashed var(--border-color); border-radius: var(--radius); padding: 1.25rem; text-align: center; background: var(--soft-surface); transition: all .15s ease; }
+    .upload-section:hover { border-color: var(--primary-color); transform: translateY(-1px); box-shadow: var(--shadow-sm); }
+    .upload-icon { font-size: 2rem; opacity: 0.8; margin-bottom: .5rem; }
+    .upload-text { color: var(--text-muted); margin-bottom: .75rem; }
+    .file-input { display: none; }
+    .file-input-label { background: var(--primary-gradient); color: #fff; padding: .6rem 1.25rem; border-radius: var(--radius-sm); cursor: pointer; font-weight: 600; box-shadow: var(--shadow-sm); display: inline-block; }
+    .file-input-label:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); }
   </style>
   </head>
 <body>
-  <header>
-    <h1>AI Orchestrator – Dashboard</h1>
-    <nav>
-      <a href="/web/logout">Logout</a>
-    </nav>
-  </header>
-  <main>
-    <section>
-      <h2>Pokreni obradu</h2>
-      <form method="post" action="/web/process">
-        <label>File path/URL (S3 ključ ili s3://)
-          <input name="file_path" placeholder="s3://bucket/key.pdf" />
-        </label>
-        <label>Korisnik
-          <input name="user_name" placeholder="user@example.com" />
-        </label>
-        <label>AI engine
-          <select name="ai_engine">
-            <option value="OpenAIEngine">OpenAIEngine</option>
-            <option value="ClaudeEngine">ClaudeEngine</option>
-            <option value="JuniorEngine">JuniorEngine</option>
-          </select>
-        </label>
-        <label>
-          <input type="checkbox" name="text_only" /> Samo MuPDF (bez AI)
-        </label>
-        <button type="submit">Procesiraj</button>
-      </form>
-      <p>Rezultat poziva bit će prikazan kao JSON odgovor.</p>
+  <div class="header">
+    <div class="header-content">
+      <h1>🚀 FileApi – Dashboard</h1>
+      <a class="logout-btn" href="/web/logout">Logout</a>
+    </div>
+  </div>
+
+  <div class="container">
+    <div class="left-col">
+    <section class="card">
+      <div class="card-header">
+        <h2>📄 Start Processing</h2>
+      </div>
+      <div class="card-body">
+        <form class="form" method="post" action="/web/process">
+          <div class="form-group">
+            <label for="file_path">File path/URL (S3 key or s3://)</label>
+            <input id="file_path" name="file_path" placeholder="s3://bucket/key.pdf" />
+          </div>
+          <div class="form-group">
+            <label for="user_name">User</label>
+            <input id="user_name" name="user_name" placeholder="user@example.com" />
+          </div>
+          <!-- Drag & Drop Upload (UI only) -->
+          <div class="upload-section" aria-label="Upload file">
+            <div class="upload-icon">📤</div>
+            <div class="upload-text">Drag & drop a file here</div>
+            <input type="file" id="file_input" class="file-input" />
+            <label for="file_input" class="file-input-label">Choose File</label>
+          </div>
+          <div class="form-group">
+            <label for="ai_engine">AI engine</label>
+            <select id="ai_engine" name="ai_engine">
+              <option value="OpenAIEngine">OpenAIEngine</option>
+              <option value="ClaudeEngine">ClaudeEngine</option>
+              <option value="JuniorEngine">JuniorEngine</option>
+            </select>
+          </div>
+          <label class="checkbox">
+            <input type="checkbox" name="text_only" /> MuPDF only (no AI)
+          </label>
+          <button class="btn btn-primary" type="submit">Process</button>
+        </form>
+        <p class="helper">The call result will be shown as JSON.</p>
+      </div>
     </section>
-    <section>
-      <h2>Praćenje</h2>
-      <form onsubmit="ev(event)">
-        <label>Job ID <input id="jid" /></label>
-        <button>Provjeri</button>
-      </form>
-      <pre id="out">(nema podataka)</pre>
-    </section>
-  </main>
+    </div>
+
+    <div class="right-col">
+      <section class="card">
+        <div class="card-header">
+          <h2>🔎 Monitoring</h2>
+        </div>
+        <div class="card-body">
+          <form class="form" onsubmit="ev(event)">
+            <div class="form-group">
+              <label for="jid">Job ID</label>
+              <input id="jid" placeholder="e.g. 7b3f3e3a-..." />
+            </div>
+            <button class="btn btn-primary" type="submit">Check</button>
+          </form>
+          <pre id="out">(no data)</pre>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h2>🖥️ System Status</h2>
+        </div>
+        <div class="card-body">
+          <div class="form">
+            <div class="form-group">
+              <label>Overall</label>
+              <div class="helper">Online • All services healthy</div>
+            </div>
+            <div class="form-group">
+              <label>Queue</label>
+              <div class="helper">jobs: 0 • delayed: 0 • dlq: 0</div>
+            </div>
+            <div class="form-group">
+              <label>Workers</label>
+              <div class="helper">active: 0 • concurrency: 0</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h2>📈 Live Metrics</h2>
+        </div>
+        <div class="card-body">
+          <div class="form" style="grid-template-columns: 1fr 1fr; display: grid; gap: 1rem;">
+            <div class="card" style="padding: 1rem; border-radius: var(--radius-sm);">
+              <div class="helper">Requests/min</div>
+              <div style="font-weight:700; font-size:1.25rem;">—</div>
+            </div>
+            <div class="card" style="padding: 1rem; border-radius: var(--radius-sm);">
+              <div class="helper">Avg latency</div>
+              <div style="font-weight:700; font-size:1.25rem;">—</div>
+            </div>
+            <div class="card" style="padding: 1rem; border-radius: var(--radius-sm);">
+              <div class="helper">Success rate</div>
+              <div style="font-weight:700; font-size:1.25rem;">—</div>
+            </div>
+            <div class="card" style="padding: 1rem; border-radius: var(--radius-sm);">
+              <div class="helper">Errors/min</div>
+              <div style="font-weight:700; font-size:1.25rem;">—</div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
   <script>
     async function ev(e){
       e.preventDefault();
       const jid = document.getElementById('jid').value;
-      const r = await fetch('/progress_spec/'+jid);
+      if(!jid) return;
+      const r = await fetch('/progress_spec/'+encodeURIComponent(jid));
       const t = await r.text();
       document.getElementById('out').textContent = t;
     }
   </script>
 </body>
 </html>
-
