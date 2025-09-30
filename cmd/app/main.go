@@ -13,7 +13,9 @@ import (
 
     cfgpkg "github.com/local/aidispatcher/internal/config"
     logpkg "github.com/local/aidispatcher/internal/logger"
+    "github.com/local/aidispatcher/internal/converter"
     "github.com/local/aidispatcher/internal/dispatcher"
+    "github.com/local/aidispatcher/internal/filetype"
     "github.com/local/aidispatcher/internal/orchestrator"
     "github.com/local/aidispatcher/internal/queue"
     "github.com/local/aidispatcher/internal/statuscheck"
@@ -62,10 +64,32 @@ func main() {
     if err != nil { log.Fatal().Err(err).Msg("failed to init page store") }
     defer ps.Close()
 
+    // LibreOffice converter
+    librePort := 8100
+    if p := os.Getenv("LIBREOFFICE_PORT"); p != "" {
+        fmt.Sscanf(p, "%d", &librePort)
+    }
+    maxWorkers := 4
+    if w := os.Getenv("LIBREOFFICE_MAX_WORKERS"); w != "" {
+        fmt.Sscanf(w, "%d", &maxWorkers)
+    }
+    conv := converter.NewLibreOffice(librePort, maxWorkers)
+    if err := conv.Initialize(); err != nil {
+        log.Warn().Err(err).Msg("LibreOffice converter initialization failed - Office document conversion will not be available")
+    } else {
+        log.Info().Msg("LibreOffice converter initialized")
+    }
+    defer conv.Shutdown()
+
+    // File type detector
+    fileTypeDetector := filetype.New()
+
     orch := orchestrator.New(orchestrator.Dependencies{
-        Queue:  rq,
-        Status: orchestrator.NewStatusAdapter(rs),
-        Pages:  ps,
+        Queue:     rq,
+        Status:    orchestrator.NewStatusAdapter(rs),
+        Pages:     ps,
+        Converter: conv,
+        FileType:  fileTypeDetector,
     })
     mux := http.NewServeMux()
     orch.RegisterRoutes(mux)

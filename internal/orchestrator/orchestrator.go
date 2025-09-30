@@ -7,11 +7,14 @@ import (
     "io"
     "net/http"
     "os"
+    "path/filepath"
     "strconv"
     "strings"
     "time"
 
     "github.com/google/uuid"
+    "github.com/local/aidispatcher/internal/converter"
+    "github.com/local/aidispatcher/internal/filetype"
     "github.com/local/aidispatcher/internal/mupdf"
     "github.com/rs/zerolog/log"
 )
@@ -36,9 +39,11 @@ type StatusStore interface {
 }
 
 type Dependencies struct {
-    Queue Queue
-    Status StatusStore
-    Pages PageStore
+    Queue     Queue
+    Status    StatusStore
+    Pages     PageStore
+    Converter *converter.LibreOffice
+    FileType  *filetype.Detector
 }
 
 type Orchestrator struct {
@@ -120,9 +125,21 @@ func (o *Orchestrator) handleProcess(w http.ResponseWriter, r *http.Request) {
     _ = o.deps.Status.Set(r.Context(), jobID, Status{Status: "queued", Progress: 0, Message: "queued", Start: &start,
         Metadata: map[string]any{"file_path": filePath, "user": user}})
 
+    // For S3/HTTP files, we need to download and potentially convert them
+    // This will be handled asynchronously in background to avoid blocking the request
+    // For now, we'll process synchronously for simplicity (TODO: make async with goroutine)
+    processedPath := filePath
+
+    // Check if we need to download and convert (S3/HTTP paths)
+    if strings.HasPrefix(filePath, "s3://") || strings.HasPrefix(filePath, "http://") || strings.HasPrefix(filePath, "https://") {
+        // For now, pass through to DetermineTotalPages which handles S3 downloads
+        // TODO: Add proper download + file type detection + conversion here
+        log.Debug().Str("job_id", jobID).Str("file", filePath).Msg("S3/HTTP file - will be downloaded on-demand")
+    }
+
     // Ako je fast_upload, forsiraj MuPDF i preskoči AI
     if req.FastUpload {
-        pages, err := DetermineTotalPages(r.Context(), filePath)
+        pages, err := DetermineTotalPages(r.Context(), processedPath)
         if err != nil { pages = 1 }
         _ = o.deps.Status.Set(r.Context(), jobID, Status{Status: "processing", Progress: 10,
             Message: "fast_upload: MuPDF only", Metadata: map[string]any{"total_pages": pages, "ai_pages": 0, "mupdf_pages": pages, "pages_done": pages}})
@@ -136,7 +153,7 @@ func (o *Orchestrator) handleProcess(w http.ResponseWriter, r *http.Request) {
     }
 
     // Odredi broj stranica (pdfcpu) i napravi selekciju
-    pages, err := DetermineTotalPages(r.Context(), filePath)
+    pages, err := DetermineTotalPages(r.Context(), processedPath)
     if err != nil {
         log.Warn().Err(err).Str("file", filePath).Msg("page count failed; defaulting to 4")
         pages = 4
@@ -217,12 +234,56 @@ func (o *Orchestrator) handleProcessUpload(w http.ResponseWriter, r *http.Reques
     _ = o.deps.Status.Set(r.Context(), jobID, Status{Status: "queued", Progress: 0, Message: "queued",
         Start: &start, Metadata: map[string]any{"file_local": localPath, "user": user, "source": "upload"}})
 
+    // Detect file type
+    fileInfo, err := o.deps.FileType.Detect(localPath)
+    if err != nil {
+        log.Error().Err(err).Str("file", localPath).Msg("failed to detect file type")
+        http.Error(w, fmt.Sprintf("file type detection failed: %v", err), http.StatusBadRequest)
+        return
+    }
+
+    if !fileInfo.Supported {
+        log.Warn().Str("mime", fileInfo.MIMEType).Str("file", localPath).Msg("unsupported file type")
+        http.Error(w, fmt.Sprintf("unsupported file type: %s", fileInfo.Description), http.StatusBadRequest)
+        return
+    }
+
+    log.Info().Str("job_id", jobID).Str("mime", fileInfo.MIMEType).Str("desc", fileInfo.Description).Msg("detected file type")
+
+    // Convert to PDF if needed (Office formats)
+    pdfPath := localPath
+    if fileInfo.MIMEType != "application/pdf" && !fileInfo.IsText {
+        log.Info().Str("job_id", jobID).Str("file", localPath).Msg("converting to PDF with LibreOffice")
+        _ = o.deps.Status.Set(r.Context(), jobID, Status{Status: "processing", Progress: 5, Message: "converting to PDF",
+            Start: &start, Metadata: map[string]any{"file_local": localPath, "user": user, "source": "upload", "original_mime": fileInfo.MIMEType}})
+
+        convertedPath := filepath.Join(filepath.Dir(localPath), fmt.Sprintf("%s_converted.pdf", jobID))
+        convJob := converter.Job{
+            InputPath:  localPath,
+            OutputPath: convertedPath,
+            Extension:  fileInfo.Extension,
+            Timeout:    180 * time.Second,
+        }
+
+        result := o.deps.Converter.ConvertToPDF(convJob)
+        if !result.Success {
+            log.Error().Str("job_id", jobID).Str("error", result.Error).Msg("conversion failed")
+            _ = o.deps.Status.Set(r.Context(), jobID, Status{Status: "failed", Progress: 0, Message: fmt.Sprintf("conversion failed: %s", result.Error),
+                Start: &start, End: &start, Metadata: map[string]any{"file_local": localPath, "user": user, "source": "upload", "error": result.Error}})
+            http.Error(w, fmt.Sprintf("conversion failed: %s", result.Error), http.StatusInternalServerError)
+            return
+        }
+
+        pdfPath = result.OutputPath
+        log.Info().Str("job_id", jobID).Str("pdf", pdfPath).Dur("duration", result.Duration).Msg("conversion successful")
+    }
+
     // Check if text_only mode is enabled
     if textOnly {
-        log.Info().Str("job_id", jobID).Str("file", localPath).Msg("Processing with MuPDF text-only mode")
+        log.Info().Str("job_id", jobID).Str("file", pdfPath).Msg("Processing with MuPDF text-only mode")
 
         // Process asynchronously with MuPDF (use background context to avoid cancellation when request ends)
-        go o.processMuPDFOnly(context.Background(), jobID, localPath)
+        go o.processMuPDFOnly(context.Background(), jobID, pdfPath)
 
         w.Header().Set("Content-Type", "application/json")
         w.WriteHeader(http.StatusCreated)
@@ -231,7 +292,7 @@ func (o *Orchestrator) handleProcessUpload(w http.ResponseWriter, r *http.Reques
     }
 
     // Page count and selection for AI mode
-    fileRef := "file://" + localPath
+    fileRef := "file://" + pdfPath
     pages, err := DetermineTotalPages(r.Context(), fileRef)
     if err != nil {
         log.Warn().Err(err).Str("file", fileRef).Msg("upload page count failed; defaulting to 1")

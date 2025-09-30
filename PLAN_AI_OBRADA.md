@@ -363,10 +363,69 @@ for msg := range stream.ConsumerGroup("jobs:ai:pages", "workers:images") {
   - Agregacija rezultata: za `source=upload` sprema lokalno (`RESULT_DIR`) preko `SaveAggregatedTextToLocal`; za ostalo i dalje S3 (`SaveAggregatedTextToS3`).
 - Web (dashboard):
   - Novi proxy endpoint `POST /web/upload` koji prosljeđuje na `/process_file_upload`.
-  - UI: dodan drag&drop upload, filtriranje ekstenzija, tekst “Supported: pdf, docx, pptx, vsdx, doc, ppt, txt”, odgođeno slanje do klika na Process, bez obrade bez fajla.
-  - Branding/UI: sve label‑e prevedene na engleski; naziv sustava “FileApi”.
+  - UI: dodan drag&drop upload, filtriranje ekstenzija, tekst "Supported: pdf, docx, pptx, vsdx, doc, ppt, txt", odgođeno slanje do klika na Process, bez obrade bez fajla.
+  - Branding/UI: sve label‑e prevedene na engleski; naziv sustava "FileApi".
 - ENV:
   - `UPLOAD_DIR` (default `./uploads`), `RESULT_DIR` (default `./uploads/results`).
+
+## Ažuriranja 2025-10-01 (File Type Detection + LibreOffice Conversion)
+- **File Type Detector** (`internal/filetype/detector.go`):
+  - Implementirana detekcija tipa fajla putem magic bytes (ne oslanja se na ekstenziju)
+  - Koristi `github.com/gabriel-vasile/mimetype` library za preciznu detekciju MIME tipova
+  - Podržani formati:
+    - **PDF**: `application/pdf`
+    - **Modern Office (ZIP-based)**: DOCX, XLSX, PPTX, VSDX, ODT, ODS, ODP
+    - **Legacy Office (OLE-based)**: DOC, XLS, PPT, VSD
+    - **Text formati**: TXT, HTML, XML, JSON, RTF
+    - **Slike**: JPEG, PNG, GIF, BMP, TIFF, WebP
+  - Posebna logika za prepoznavanje:
+    - ZIP-based Office formati (DOCX/XLSX/PPTX detektirani kao ZIP) → fallback na ekstenziju
+    - OLE/CFB-based Office formati (DOC/XLS/PPT detektirani kao `application/x-ole-storage`) → fallback na ekstenziju
+  - API: `Detect(filePath) (*FileTypeInfo, error)` vraća MIME tip, ekstenziju, i flagove (`Supported`, `IsText`, `NeedsOCR`)
+
+- **LibreOffice Converter** (`internal/converter/libreoffice.go`):
+  - Automatska konverzija Office dokumenata u PDF prije obrade
+  - Worker pool s konfigurabilan brojem paralelnih konverzija (`LIBREOFFICE_MAX_WORKERS`, default: 4)
+  - LibreOffice headless server na portu 8100 (konfigurabilan via `LIBREOFFICE_PORT`)
+  - Timeout zaštita (default 180s po konverziji)
+  - Detekcija password-protected dokumenata (vraća `IsProtected=true` bez pokušaja konverzije)
+  - Graceful initialization s fallback-om (servis radi i bez LibreOffice-a, ali ne podržava Office formate)
+  - Podržani formati za konverziju: DOC, DOCX, XLS, XLSX, PPT, PPTX, ODT, ODS, ODP, VSD, VSDX, RTF, HTML
+
+- **Orchestrator integracija**:
+  - `handleProcessUpload`: Prije obrade uploadanog fajla:
+    1. Detektuje tip fajla putem `FileType.Detect()`
+    2. Provjerava da li je podržan format (`!fileInfo.Supported` → HTTP 400)
+    3. Ako je Office format (ne-PDF i ne-text) → automatska konverzija u PDF pomoću LibreOffice
+    4. Konvertirani PDF sprema se kao `{jobID}_converted.pdf` u istom direktoriju
+    5. Dalja obrada (page count, AI/MuPDF pipeline) radi s PDF verzijom
+  - `handleProcess` (S3 putanje): TODO marker dodan za budući download+konverziju S3 dokumenata
+  - Status tracking:
+    - Progress 5% dok traje konverzija ("converting to PDF")
+    - Metadata sadrži `original_mime` za praćenje izvornog formata
+    - Konverzijske greške vraćaju status `failed` s detaljnom porukom
+
+- **Main.go inicijalizacija** (`cmd/app/main.go`):
+  - LibreOffice converter inicijalizacija pri startupu:
+    - Provjera da li je LibreOffice instaliran (`libreoffice --version`)
+    - Pokretanje headless servera s UNO protokolom
+    - Health check s test konverzijom
+    - Log poruke: "LibreOffice converter initialized successfully" ili warning ako nije dostupan
+  - File type detector inicijalizacija (bez external dependencies)
+  - Dependency injection u Orchestrator Dependencies (`Converter`, `FileType`)
+  - Graceful shutdown LibreOffice servera pri gašenju aplikacije
+
+- **ENV varijable**:
+  - `LIBREOFFICE_PORT` (default: 8100) - port za LibreOffice headless server
+  - `LIBREOFFICE_MAX_WORKERS` (default: 4) - max broj paralelnih konverzija
+
+- **Dependencies**:
+  - Dodana `github.com/gabriel-vasile/mimetype v1.4.3` u `go.mod`
+
+- **Log poruke**:
+  - File type detection: `detected file type`, `ZIP detected, checking extension`, `OLE storage detected, checking extension`
+  - Conversion: `converting to PDF with LibreOffice`, `conversion successful`, `conversion failed`
+  - LibreOffice: `initializing LibreOffice converter`, `LibreOffice server started`, `LibreOffice converter initialized`
 
 Open TODOs za ovaj dio:
 - Dashboard: dodati “Download result” gumb kad je `status=success` i `source=upload` (zove `/download_result/{job_id}`).
@@ -432,10 +491,20 @@ Ovaj odjeljak definira hibridni Orchestrator koji prima zahtjeve od GhostServer�
 ### Tok za POST /process_file_upload (dashboard upload)
 1. Validacija multipart zahtjeva i polja `file`, `user_name`, `ai_engine`, `text_only`.
 2. Spremanje datoteke lokalno u `UPLOAD_DIR` (default `./uploads`) i generiranje `file://` reference; `status.Metadata.source = "upload"` i `status.Metadata.file_local`.
-3. Brojanje stranica i selekcija (isti selektor kao i S3/URL put).
-4. Enqueue AI stranica u isti Redis Stream (`jobs:ai:pages`) – worker pipeline je identičan.
-5. Agregacija: objediniti rezultate i, za upload poslove, spremiti agregirani tekst lokalno (`RESULT_DIR`, default `./uploads/results`). U status dodati `result_local_path` i `result_text_len` te označiti `success`.
-6. Dashboard može preuzeti rezultat preko `GET /download_result/{job_id}`.
+3. **File type detection i konverzija** (novo od 2025-10-01):
+   - Detektuje tip fajla putem magic bytes (`FileType.Detect()`)
+   - Provjerava da li je format podržan (inače vraća HTTP 400 sa opisom greške)
+   - Ako je Office format (DOC/DOCX/XLS/XLSX/PPT/PPTX/ODT/ODS/ODP):
+     - Pokreće LibreOffice konverziju u PDF (`Converter.ConvertToPDF()`)
+     - Konvertirani PDF: `{jobID}_converted.pdf` u istom direktoriju
+     - Status: progress 5%, message "converting to PDF"
+     - Metadata: `original_mime` sadrži MIME tip izvornog dokumenta
+   - Ako konverzija ne uspije → status `failed` sa detaljnom greškom
+   - PDF i text formati preskaču konverziju
+4. Brojanje stranica i selekcija (isti selektor kao i S3/URL put, ali sada radi s PDF verzijom dokumenta).
+5. Enqueue AI stranica u isti Redis Stream (`jobs:ai:pages`) – worker pipeline je identičan.
+6. Agregacija: objediniti rezultate i, za upload poslove, spremiti agregirani tekst lokalno (`RESULT_DIR`, default `./uploads/results`). U status dodati `result_local_path` i `result_text_len` te označiti `success`.
+7. Dashboard može preuzeti rezultat preko `GET /download_result/{job_id}`.
 
 ## Pokretanje servisa (Docker Compose)
 - Preduvjeti:
