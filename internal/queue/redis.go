@@ -2,7 +2,6 @@ package queue
 
 import (
     "context"
-    "errors"
     "fmt"
     "strings"
     "time"
@@ -50,8 +49,7 @@ func NewRedisQueue(redisURL, stream, group string, poll time.Duration) (*RedisQu
         stop:         make(chan struct{}),
     }
     // Ensure consumer group exists (MKSTREAM creates stream if missing)
-    if err := c.XGroupCreateMkStream(ctx, stream, group, "$"
-    ).Err(); err != nil && !isBusyGroupErr(err) {
+    if err := c.XGroupCreateMkStream(ctx, stream, group, "$").Err(); err != nil && !isBusyGroupErr(err) {
         return nil, fmt.Errorf("xgroup create: %w", err)
     }
     // Start delayed mover
@@ -61,8 +59,7 @@ func NewRedisQueue(redisURL, stream, group string, poll time.Duration) (*RedisQu
 
 func isBusyGroupErr(err error) bool {
     if err == nil { return false }
-    if errors.Is(err, redis.ErrBusyGroup) { return true }
-    // go-redis may return a generic error string from Redis
+    // go-redis returns a generic Redis error string; detect BUSYGROUP substring
     return strings.Contains(strings.ToUpper(err.Error()), "BUSYGROUP")
 }
 
