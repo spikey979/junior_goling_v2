@@ -185,45 +185,16 @@ func (o *Orchestrator) handleProcess(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Odredi broj stranica (pdfcpu) i napravi selekciju
-    pages, err := DetermineTotalPages(r.Context(), processedPath)
-    if err != nil {
-        log.Warn().Err(err).Str("file", filePath).Msg("page count failed; defaulting to 4")
-        pages = 4
-    }
-    log.Info().Str("job_id", jobID).Str("file", filePath).Int("total_pages", pages).Msg("orchestrator detected page count")
-    sel := SelectPages(SelectionOptions{TextOnly: req.TextOnly, TotalPages: pages})
-    log.Info().Str("job_id", jobID).Int("ai_pages", len(sel.AIPages)).Int("mupdf_pages", len(sel.MuPDFPages)).Msg("orchestrator allocated pages")
-    // enqueue AI stranice
-    for _, p := range sel.AIPages {
-        payload := map[string]any{
-            "job_id": jobID,
-            "file_path": filePath,
-            "page_id": p,
-            "content_ref": fmt.Sprintf("%s#page=%d", filePath, p),
-            "user": user,
-            "ai_engine": req.AIEngine,
-            "text_only": req.TextOnly,
-            "idempotency_key": fmt.Sprintf("doc:%s:page:%d", jobID, p),
-            "attempt": 1,
-        }
-        if req.Source != "" { payload["source"] = req.Source } else { payload["source"] = "api" }
-        data, _ := json.Marshal(payload)
-        if err := o.deps.Queue.EnqueueAI(r.Context(), data); err != nil {
-            log.Error().Err(err).Msg("enqueue failed")
-            http.Error(w, "queue unavailable", http.StatusServiceUnavailable)
-            return
-        }
-        log.Info().Str("job_id", jobID).Int("page_id", p).Str("ai_engine", req.AIEngine).Msg("enqueued page for AI")
-    }
-    // update status
-    _ = o.deps.Status.Set(r.Context(), jobID, Status{Status: "processing", Progress: 10, Message: "enqueued AI pages",
-        Metadata: map[string]any{"total_pages": pages, "ai_pages": len(sel.AIPages), "mupdf_pages": len(sel.MuPDFPages), "pages_done": 0, "pages_failed": 0}})
+    // AI mode: Use full pipeline (download, classify, prepare for AI)
+    log.Info().Str("job_id", jobID).Str("file", processedPath).Str("ai_engine", req.AIEngine).Msg("Processing with full AI pipeline")
+
+    // Run AI pipeline asynchronously
+    go o.ProcessJobForAI(context.Background(), jobID, processedPath, user, req.Password)
 
     resp := processResp{
         Status:  "ok",
         JobID:   jobID,
-        Message: "File processing job created successfully",
+        Message: "AI pipeline processing started",
         Metadata: map[string]any{"ai_engine": req.AIEngine, "timestamp": time.Now().Format(time.RFC3339)},
     }
     w.Header().Set("Content-Type", "application/json")
