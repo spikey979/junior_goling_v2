@@ -3,14 +3,14 @@ package orchestrator
 import (
 	"context"
 	"fmt"
-	"image/png"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/gen2brain/go-fitz"
+	"github.com/local/aidispatcher/internal/config"
 	"github.com/local/aidispatcher/internal/converter"
+	"github.com/local/aidispatcher/internal/imagerender"
 	"github.com/local/aidispatcher/internal/mupdf"
 	"github.com/rs/zerolog/log"
 )
@@ -25,11 +25,15 @@ type PageClassification struct {
 
 // AIPagePayload represents data prepared for AI processing
 type AIPagePayload struct {
-	PageNum      int
-	ImagePath    string // Path to PNG image
-	ContextText  string // Text from surrounding pages
-	MuPDFText    string // Extracted MuPDF text (if available)
-	Classification string
+	PageNum        int
+	ImageBytes     []byte // In-memory JPEG bytes
+	ImageBase64    string // Base64 encoded image for JSON
+	ImageMIME      string // "image/jpeg"
+	WidthPx        int    // Image width in pixels
+	HeightPx       int    // Image height in pixels
+	ContextText    string // Text from surrounding pages (limited by MaxContextBytes)
+	MuPDFText      string // Extracted MuPDF text
+	Classification string // "TEXT_ONLY" or "HAS_GRAPHICS"
 }
 
 // ProcessJobForAI handles complete AI pipeline: download, convert, classify, extract, prepare
@@ -115,11 +119,8 @@ func (o *Orchestrator) ProcessJobForAI(ctx context.Context, jobID, filePath, use
 		},
 	})
 
-	// Step 4: PNG rendering and payload preparation - 40-50%
-	payloads, cleanupImages, err := o.prepareAIPayloads(ctx, pdfPath, classifications, pageTexts, jobID)
-	if cleanupImages != nil {
-		defer cleanupImages()
-	}
+	// Step 4: Image rendering and payload preparation - 40-50%
+	payloads, err := o.prepareAIPayloads(ctx, pdfPath, classifications, pageTexts, jobID)
 	if err != nil {
 		return fmt.Errorf("failed to prepare AI payloads: %w", err)
 	}
@@ -331,63 +332,66 @@ func (o *Orchestrator) classifyPages(ctx context.Context, pdfPath string, pageTe
 	return classifications, nil
 }
 
-// prepareAIPayloads renders pages to PNG and prepares payloads with context
-func (o *Orchestrator) prepareAIPayloads(ctx context.Context, pdfPath string, classifications []PageClassification, pageTexts map[int]string, jobID string) ([]AIPagePayload, func(), error) {
-	var cleanupFuncs []func()
-	cleanup := func() {
-		for _, fn := range cleanupFuncs {
-			fn()
-		}
-	}
-
-	// Open PDF for rendering
-	doc, err := fitz.New(pdfPath)
-	if err != nil {
-		return nil, cleanup, fmt.Errorf("failed to open PDF for rendering: %w", err)
-	}
-	defer doc.Close()
-
-	// Create temp directory for PNG files
-	tempDir, err := os.MkdirTemp("", fmt.Sprintf("ai_pages_%s_*", jobID))
-	if err != nil {
-		return nil, cleanup, fmt.Errorf("failed to create temp directory: %w", err)
-	}
-	cleanupFuncs = append(cleanupFuncs, func() { os.RemoveAll(tempDir) })
+// prepareAIPayloads renders pages to JPEG (in-memory) and prepares payloads with context
+func (o *Orchestrator) prepareAIPayloads(ctx context.Context, pdfPath string, classifications []PageClassification, pageTexts map[int]string, jobID string) ([]AIPagePayload, error) {
+	// Get image options from config
+	opts := config.DefaultImageOptions()
 
 	var payloads []AIPagePayload
+	var totalImageBytes int64
 
 	for _, class := range classifications {
-		// Render page to PNG
-		imagePath := filepath.Join(tempDir, fmt.Sprintf("page_%d.png", class.PageNum))
+		var imageBytes []byte
+		var imageBase64 string
+		var widthPx, heightPx int
+		var imageMIME string
 
-		// Render using go-fitz (pageNum is 1-based, but Image() expects 0-based)
-		img, err := doc.Image(class.PageNum - 1)
-		if err != nil {
-			log.Warn().Err(err).Int("page", class.PageNum).Msg("failed to render page to image")
-			continue
+		// Only render images for HAS_GRAPHICS pages (unless SendAllPages=true)
+		shouldRenderImage := class.Classification == "HAS_GRAPHICS" || opts.SendAllPages
+
+		if shouldRenderImage {
+			// Render page to JPEG (in-memory)
+			jpegBytes, width, height, err := imagerender.RenderPageToJPEG(
+				pdfPath,
+				class.PageNum,
+				opts.DPI,
+				opts.JPEGQuality,
+				opts.Color,
+			)
+			if err != nil {
+				log.Warn().Err(err).Int("page", class.PageNum).Msg("failed to render page to JPEG")
+			} else {
+				imageBytes = jpegBytes
+				widthPx = width
+				heightPx = height
+				imageMIME = "image/jpeg"
+				totalImageBytes += int64(len(jpegBytes))
+
+				// Encode to base64 if requested
+				if opts.IncludeBase64 {
+					imageBase64 = imagerender.EncodeToBase64(jpegBytes)
+				}
+
+				log.Debug().
+					Str("job_id", jobID).
+					Int("page", class.PageNum).
+					Int("jpeg_size", len(jpegBytes)).
+					Int("width", width).
+					Int("height", height).
+					Msg("rendered page to JPEG (in-memory)")
+			}
 		}
 
-		// Save as PNG
-		outFile, err := os.Create(imagePath)
-		if err != nil {
-			log.Warn().Err(err).Int("page", class.PageNum).Msg("failed to create PNG file")
-			continue
-		}
-
-		// Encode image as PNG
-		err = png.Encode(outFile, img)
-		outFile.Close()
-		if err != nil {
-			log.Warn().Err(err).Int("page", class.PageNum).Msg("failed to write PNG file")
-			continue
-		}
-
-		// Prepare context text (radius = 1 page before/after)
-		contextText := prepareContextText(pageTexts, class.PageNum, 1)
+		// Prepare context text with size limit
+		contextText := prepareContextTextWithLimit(pageTexts, class.PageNum, opts.ContextRadius, opts.MaxContextBytes)
 
 		payload := AIPagePayload{
 			PageNum:        class.PageNum,
-			ImagePath:      imagePath,
+			ImageBytes:     imageBytes,
+			ImageBase64:    imageBase64,
+			ImageMIME:      imageMIME,
+			WidthPx:        widthPx,
+			HeightPx:       heightPx,
 			ContextText:    contextText,
 			MuPDFText:      class.MuPDFText,
 			Classification: class.Classification,
@@ -398,17 +402,19 @@ func (o *Orchestrator) prepareAIPayloads(ctx context.Context, pdfPath string, cl
 		log.Debug().
 			Str("job_id", jobID).
 			Int("page", class.PageNum).
-			Str("image", imagePath).
+			Bool("has_image", len(imageBytes) > 0).
 			Int("context_chars", len(contextText)).
+			Int("mupdf_chars", len(class.MuPDFText)).
 			Msg("prepared AI payload")
 	}
 
 	log.Info().
 		Str("job_id", jobID).
 		Int("payloads", len(payloads)).
-		Msg("AI payload preparation completed")
+		Int64("total_image_bytes", totalImageBytes).
+		Msg("AI payload preparation completed (in-memory)")
 
-	return payloads, cleanup, nil
+	return payloads, nil
 }
 
 // Helper functions
@@ -460,6 +466,23 @@ func prepareContextText(pageTexts map[int]string, pageNum, radius int) string {
 	}
 
 	return strings.Join(contextParts, "\n\n")
+}
+
+// prepareContextTextWithLimit prepares context text with byte size limit
+func prepareContextTextWithLimit(pageTexts map[int]string, pageNum, radius, maxBytes int) string {
+	fullContext := prepareContextText(pageTexts, pageNum, radius)
+
+	// Truncate if exceeds maxBytes
+	if len(fullContext) > maxBytes {
+		truncated := fullContext[:maxBytes]
+		// Try to truncate at word boundary if possible
+		if lastSpace := strings.LastIndex(truncated, " "); lastSpace > maxBytes-100 {
+			truncated = truncated[:lastSpace]
+		}
+		return truncated + "...[truncated]"
+	}
+
+	return fullContext
 }
 
 func truncateText(text string, maxLen int) string {

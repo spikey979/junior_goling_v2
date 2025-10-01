@@ -66,6 +66,18 @@ type QueueConfig struct {
     PollInterval time.Duration
 }
 
+// ImageOptions defines image rendering options for AI processing
+type ImageOptions struct {
+    SendAllPages    bool   // false = only HAS_GRAPHICS pages get images
+    DPI             int    // rendering DPI (100)
+    Color           string // "rgb" or "gray"
+    Format          string // "jpeg"
+    JPEGQuality     int    // 70 (1-100)
+    ContextRadius   int    // ±N pages for context (1)
+    MaxContextBytes int    // max context text size in bytes (3000)
+    IncludeBase64   bool   // convert to base64 for JSON transport
+}
+
 // Config is the top-level configuration.
 type Config struct {
     Logging   LoggingConfig
@@ -73,6 +85,7 @@ type Config struct {
     Providers ProvidersConfig
     Worker    WorkerConfig
     Queue     QueueConfig
+    Image     ImageOptions
 }
 
 // FromEnv loads configuration from environment with sensible defaults.
@@ -142,7 +155,24 @@ func FromEnv() Config {
         PollInterval: parseDuration(getEnv("QUEUE_POLL_INTERVAL", "100ms"), 100*time.Millisecond),
     }
 
+    // Image defaults
+    cfg.Image = DefaultImageOptions()
+
     return cfg
+}
+
+// DefaultImageOptions returns default image rendering options
+func DefaultImageOptions() ImageOptions {
+    return ImageOptions{
+        SendAllPages:    parseBool(getEnv("IMAGE_SEND_ALL_PAGES", "false")),
+        DPI:             parseInt(getEnv("IMAGE_DPI", "100"), 100),
+        Color:           getEnv("IMAGE_COLOR", "rgb"),
+        Format:          getEnv("IMAGE_FORMAT", "jpeg"),
+        JPEGQuality:     parseInt(getEnv("IMAGE_JPEG_QUALITY", "70"), 70),
+        ContextRadius:   parseInt(getEnv("IMAGE_CONTEXT_RADIUS", "1"), 1),
+        MaxContextBytes: parseInt(getEnv("IMAGE_MAX_CONTEXT_BYTES", "3000"), 3000),
+        IncludeBase64:   parseBool(getEnv("IMAGE_INCLUDE_BASE64", "true")),
+    }
 }
 
 // Helpers

@@ -16,6 +16,7 @@ import (
     "github.com/local/aidispatcher/internal/converter"
     "github.com/local/aidispatcher/internal/filetype"
     "github.com/local/aidispatcher/internal/mupdf"
+    "github.com/local/aidispatcher/internal/pdftest"
     "github.com/rs/zerolog/log"
 )
 
@@ -156,21 +157,10 @@ func (o *Orchestrator) handleProcess(w http.ResponseWriter, r *http.Request) {
         fileID := extractFileIDFromS3Path(filePath)
         if fileID != "" {
             _ = o.deps.Status.SetFileJobMapping(r.Context(), fileID, jobID)
-            log.Debug().Str("file_id", fileID).Str("job_id", jobID).Msg("created file-to-job mapping")
         }
     }
 
-    // For S3/HTTP files, we need to download and potentially convert them
-    // This will be handled asynchronously in background to avoid blocking the request
-    // For now, we'll process synchronously for simplicity (TODO: make async with goroutine)
     processedPath := filePath
-
-    // Check if we need to download and convert (S3/HTTP paths)
-    if strings.HasPrefix(filePath, "s3://") || strings.HasPrefix(filePath, "http://") || strings.HasPrefix(filePath, "https://") {
-        // For now, pass through to DetermineTotalPages which handles S3 downloads
-        // TODO: Add proper download + file type detection + conversion here
-        log.Debug().Str("job_id", jobID).Str("file", filePath).Msg("S3/HTTP file - will be downloaded on-demand")
-    }
 
     // Ako je text_only ili fast_upload, forsiraj MuPDF i preskoči AI
     if req.TextOnly || req.FastUpload {
@@ -286,13 +276,39 @@ func (o *Orchestrator) handleProcessUpload(w http.ResponseWriter, r *http.Reques
     if textOnly {
         log.Info().Str("job_id", jobID).Str("file", pdfPath).Msg("Processing with MuPDF text-only mode")
 
-        // Process asynchronously with MuPDF (use background context to avoid cancellation when request ends)
-        go o.processMuPDFOnly(context.Background(), jobID, pdfPath)
+        // Check if MuPDF can extract text from this PDF
+        hasText, diag, err := pdftest.HasExtractableText(pdfPath, 300)
+        if err != nil {
+            log.Warn().Err(err).Str("job_id", jobID).Msg("MuPDF text extractability check failed, continuing anyway")
+        } else {
+            log.Info().
+                Str("job_id", jobID).
+                Bool("has_extractable_text", hasText).
+                Int("total_chars_sampled", diag.TotalCharsInSample).
+                Int("threshold", diag.Threshold).
+                Msg("MuPDF text extractability check completed")
 
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(http.StatusCreated)
-        _ = json.NewEncoder(w).Encode(processResp{Status: "ok", JobID: jobID, Message: "Text extraction started"})
-        return
+            if !hasText {
+                log.Warn().
+                    Str("job_id", jobID).
+                    Int("total_chars", diag.TotalCharsInSample).
+                    Msg("PDF has no extractable text, ignoring text_only flag and using AI mode")
+
+                // Graceful fallback: ignore text_only and continue to AI mode below
+                textOnly = false
+            }
+        }
+
+        // If still text_only after check, process with MuPDF
+        if textOnly {
+            // Process asynchronously with MuPDF (use background context to avoid cancellation when request ends)
+            go o.processMuPDFOnly(context.Background(), jobID, pdfPath)
+
+            w.Header().Set("Content-Type", "application/json")
+            w.WriteHeader(http.StatusCreated)
+            _ = json.NewEncoder(w).Encode(processResp{Status: "ok", JobID: jobID, Message: "Text extraction started"})
+            return
+        }
     }
 
     // Page count and selection for AI mode
@@ -329,6 +345,17 @@ func (o *Orchestrator) handleProcessUpload(w http.ResponseWriter, r *http.Reques
 
     _ = o.deps.Status.Set(r.Context(), jobID, Status{Status: "processing", Progress: 10,
         Message: "enqueued AI pages", Metadata: map[string]any{"total_pages": pages, "ai_pages": len(sel.AIPages), "mupdf_pages": len(sel.MuPDFPages), "pages_done": 0, "pages_failed": 0, "file_local": localPath, "source": "upload"}})
+
+    // Start document-level timeout monitor in background
+    // Default timeout 3m unless overridden via DOCUMENT_PROCESSING_TIMEOUT
+    go func(jid string, total int){
+        to := os.Getenv("DOCUMENT_PROCESSING_TIMEOUT")
+        dur, err := time.ParseDuration(to)
+        if err != nil || dur <= 0 { dur = 3 * time.Minute }
+        ctx, cancel := context.WithTimeout(context.Background(), dur)
+        defer cancel()
+        o.monitorJobCompletion(ctx, jid, total)
+    }(jobID, pages)
 
     w.Header().Set("Content-Type", "application/json")
     w.WriteHeader(http.StatusCreated)
@@ -484,13 +511,16 @@ func (o *Orchestrator) handlePageFailed(w http.ResponseWriter, r *http.Request) 
     failed := intFromMeta(st.Metadata, "pages_failed") + 1
     total := intFromMeta(st.Metadata, "total_pages")
     st.Metadata["pages_failed"] = failed
-    // Extract MuPDF text for this page and save
+    // Save MuPDF text for this page: prefer existing stored text; if empty, extract on-demand
     pageNum, _ := strconv.Atoi(pageIDStr)
     filePath, _ := st.Metadata["file_path"].(string)
     if filePath == "" { filePath = jobID }
-    if txt, err := ExtractPageText(r.Context(), filePath, pageNum); err == nil {
-        _ = o.deps.Pages.SavePageText(r.Context(), jobID, pageNum, txt, "mupdf", "", "")
+    // Try to use pre-existing text (if any)
+    txt, _ := o.deps.Pages.GetPageText(r.Context(), jobID, pageNum)
+    if txt == "" {
+        if t2, err := ExtractPageText(r.Context(), filePath, pageNum); err == nil { txt = t2 }
     }
+    if txt != "" { _ = o.deps.Pages.SavePageText(r.Context(), jobID, pageNum, txt, "mupdf", "", "") }
     if total > 0 { st.Progress = int(float64(done+failed) / float64(total) * 100) }
     st.Message = fmt.Sprintf("page %s failed (fallback to MuPDF)", pageIDStr)
     log.Warn().Str("job_id", jobID).Int("page_id", pageNum).Int("pages_done", done).Int("pages_failed", failed).Int("total_pages", total).Msg("page failed; MuPDF fallback")
@@ -553,6 +583,103 @@ func (o *Orchestrator) handleCancelJob(w http.ResponseWriter, r *http.Request) {
     now := time.Now(); st.End = &now
     _ = o.deps.Status.Set(r.Context(), req.JobID, st)
     _ = json.NewEncoder(w).Encode(map[string]any{"success": true, "job_id": req.JobID, "status": "cancelled"})
+}
+
+// monitorJobCompletion enforces a document-level SLA. It finalizes the job with
+// partial results on timeout by applying MuPDF fallback for missing pages, and cancels the job in the queue.
+func (o *Orchestrator) monitorJobCompletion(ctx context.Context, jobID string, totalPages int) {
+    ticker := time.NewTicker(1 * time.Second)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ctx.Done():
+            // Timeout reached: finalize with partial results and cancel further processing
+            st, ok, _ := o.deps.Status.Get(context.Background(), jobID)
+            if !ok { return }
+            // Apply MuPDF fallback for pages without text
+            for i := 1; i <= totalPages; i++ {
+                t, _ := o.deps.Pages.GetPageText(context.Background(), jobID, i)
+                if t == "" {
+                    // Determine file reference
+                    var fileRef string
+                    if st.Metadata != nil {
+                        if v, _ := st.Metadata["file_local"].(string); v != "" { fileRef = v }
+                        if fileRef == "" { if v, _ := st.Metadata["file_path"].(string); v != "" { fileRef = v } }
+                    }
+                    if txt := o.getMuPDFTextForPage(context.Background(), fileRef, i); txt != "" {
+                        _ = o.deps.Pages.SavePageText(context.Background(), jobID, i, txt, "mupdf_timeout_fallback", "", "")
+                    }
+                }
+            }
+            // Cancel job to stop workers processing further
+            _ = o.deps.Queue.CancelJob(context.Background(), jobID)
+            // Finalize status
+            o.finalizeJobWithPartialResults(context.Background(), jobID, totalPages)
+            return
+        case <-ticker.C:
+            st, ok, _ := o.deps.Status.Get(context.Background(), jobID)
+            if !ok { continue }
+            if st.Status == "success" { return }
+            done := intFromMeta(st.Metadata, "pages_done")
+            failed := intFromMeta(st.Metadata, "pages_failed")
+            if done+failed >= totalPages {
+                // Normal completion: ensure aggregation done; if already handled by handlers, this no-ops
+                o.finalizeJobComplete(context.Background(), jobID, totalPages)
+                return
+            }
+        }
+    }
+}
+
+// finalizeJobComplete aggregates and stores the result when all pages are done/failed.
+func (o *Orchestrator) finalizeJobComplete(ctx context.Context, jobID string, totalPages int) {
+    st, ok, err := o.deps.Status.Get(ctx, jobID)
+    if err != nil || !ok { return }
+    if st.Status == "success" { return }
+    agg, _ := o.deps.Pages.AggregateText(ctx, jobID, totalPages)
+    if st.Metadata == nil { st.Metadata = map[string]any{} }
+    st.Metadata["result_text_len"] = len(agg)
+    // Save result depending on source
+    if src, _ := st.Metadata["source"].(string); src == "upload" {
+        if localPath, err := SaveAggregatedTextToLocal(ctx, jobID, agg); err == nil {
+            st.Metadata["result_local_path"] = localPath
+        }
+    } else {
+        filePath, _ := st.Metadata["file_path"].(string)
+        password, _ := st.Metadata["password"].(string)
+        if s3url, err := SaveAggregatedTextToS3(ctx, filePath, jobID, agg, password); err == nil {
+            st.Metadata["result_s3_url"] = s3url
+        }
+    }
+    st.Status = "success"
+    st.Progress = 100
+    _ = o.deps.Status.Set(ctx, jobID, st)
+}
+
+// finalizeJobWithPartialResults finalizes with timeout metadata and aggregated result.
+func (o *Orchestrator) finalizeJobWithPartialResults(ctx context.Context, jobID string, totalPages int) {
+    st, ok, err := o.deps.Status.Get(ctx, jobID)
+    if err != nil || !ok { return }
+    done := intFromMeta(st.Metadata, "pages_done")
+    failed := intFromMeta(st.Metadata, "pages_failed")
+    missing := totalPages - (done + failed)
+    o.finalizeJobComplete(ctx, jobID, totalPages)
+    // Re-read to update metadata
+    st2, ok2, _ := o.deps.Status.Get(ctx, jobID)
+    if ok2 {
+        if st2.Metadata == nil { st2.Metadata = map[string]any{} }
+        st2.Metadata["timeout_occurred"] = true
+        st2.Metadata["missing_pages"] = missing
+        _ = o.deps.Status.Set(ctx, jobID, st2)
+    }
+}
+
+// getMuPDFTextForPage extracts text using MuPDF from a file reference.
+func (o *Orchestrator) getMuPDFTextForPage(ctx context.Context, fileRef string, page int) string {
+    if fileRef == "" { return "" }
+    txt, err := ExtractPageText(ctx, fileRef, page)
+    if err != nil { return "" }
+    return txt
 }
 
 // processMuPDFOnly handles text-only extraction using MuPDF without AI
@@ -892,6 +1019,32 @@ func (o *Orchestrator) processMuPDFOnlyFromS3(ctx context.Context, jobID, s3Path
             Metadata: map[string]any{"error": err.Error()},
         })
         return
+    }
+
+    // Check if MuPDF can extract text from this PDF
+    hasText, diag, err := pdftest.HasExtractableText(pdfPath, 300)
+    if err != nil {
+        log.Warn().Err(err).Str("job_id", jobID).Msg("MuPDF text extractability check failed, continuing anyway")
+    } else {
+        log.Info().
+            Str("job_id", jobID).
+            Bool("has_extractable_text", hasText).
+            Int("total_chars_sampled", diag.TotalCharsInSample).
+            Int("threshold", diag.Threshold).
+            Int("sampled_pages_count", len(diag.SampledPages)).
+            Msg("MuPDF text extractability check completed")
+
+        if !hasText {
+            log.Warn().
+                Str("job_id", jobID).
+                Int("total_chars", diag.TotalCharsInSample).
+                Int("threshold", diag.Threshold).
+                Msg("PDF has no extractable text, switching to AI mode")
+
+            // Graceful fallback: switch to AI pipeline instead of failing
+            o.ProcessJobForAI(ctx, jobID, s3Path, user, password)
+            return
+        }
     }
 
     log.Info().Str("job_id", jobID).Int("pages", pageCount).Msg("Starting MuPDF text extraction from S3 file")
