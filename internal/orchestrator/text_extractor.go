@@ -38,7 +38,7 @@ func ensureLocalPDF(ctx context.Context, ref string) (string, string, error) {
         p, err := downloadHTTPToTemp(ctx, ref)
         return p, p, err
     case strings.HasPrefix(ref, "s3://"):
-        p, err := downloadS3ToTemp(ctx, ref)
+        p, err := downloadS3ToTemp(ctx, ref, "") // TODO: pass password if needed
         return p, p, err
     default:
         return ref, "", nil

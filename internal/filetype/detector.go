@@ -40,6 +40,30 @@ func (d *Detector) Detect(filePath string) (*FileTypeInfo, error) {
 
 	log.Debug().Str("mime", mimeType).Str("ext", extension).Str("file", filePath).Msg("detected file type")
 
+	// Special handling for files that mimetype doesn't recognize properly
+	// If mimetype returns generic octet-stream but file has a known extension, trust the extension
+	if mimeType == "application/octet-stream" {
+		ext := strings.ToLower(filepath.Ext(filePath))
+		switch ext {
+		case ".pdf":
+			mimeType = "application/pdf"
+			extension = ".pdf"
+			log.Debug().Str("file", filePath).Msg("overriding octet-stream to PDF based on extension")
+		case ".docx":
+			mimeType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+			extension = ".docx"
+			log.Debug().Str("file", filePath).Msg("overriding octet-stream to DOCX based on extension")
+		case ".xlsx":
+			mimeType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+			extension = ".xlsx"
+			log.Debug().Str("file", filePath).Msg("overriding octet-stream to XLSX based on extension")
+		case ".pptx":
+			mimeType = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+			extension = ".pptx"
+			log.Debug().Str("file", filePath).Msg("overriding octet-stream to PPTX based on extension")
+		}
+	}
+
 	// Special handling for ZIP-based Office formats
 	// Many modern Office formats are actually ZIP files with specific structure
 	if mimeType == "application/zip" || strings.Contains(mimeType, "application/x-zip") {
