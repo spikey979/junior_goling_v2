@@ -40,12 +40,12 @@ func New(status *statuscheck.Checker) *Web {
 func (w *Web) RegisterRoutes(mux *http.ServeMux) {
     mux.HandleFunc("/web/login", w.handleLogin)
     mux.HandleFunc("/web/logout", w.handleLogout)
-    mux.HandleFunc("/web/", w.requireAuth(w.handleDashboard))
-    mux.HandleFunc("/web/dashboard", w.requireAuth(w.handleDashboard))
+    mux.HandleFunc("/web/system_status", w.requireAuth(w.handleSystemStatus))
     mux.HandleFunc("/web/process", w.requireAuth(w.handleProcess))
     mux.HandleFunc("/web/upload", w.requireAuth(w.handleUpload))
     mux.HandleFunc("/web/progress/", w.requireAuth(w.handleProgress))
-    mux.HandleFunc("/web/system_status", w.requireAuth(w.handleSystemStatus))
+    mux.HandleFunc("/web/dashboard", w.requireAuth(w.handleDashboard))
+    mux.HandleFunc("/web/", w.requireAuth(w.handleDashboard))
 }
 
 func (w *Web) render(wr http.ResponseWriter, name string, data any) {
