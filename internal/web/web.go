@@ -2,14 +2,19 @@ package web
 
 import (
     "bytes"
+    "context"
     "encoding/json"
     "fmt"
     "html/template"
+    "mime/multipart"
     "io"
     "net/http"
     "os"
     "path/filepath"
     "strings"
+    "time"
+
+    "github.com/local/aidispatcher/internal/statuscheck"
 )
 
 type Web struct {
@@ -17,9 +22,10 @@ type Web struct {
     username  string
     password  string
     port      string
+    status    *statuscheck.Checker
 }
 
-func New() *Web {
+func New(status *statuscheck.Checker) *Web {
     // load templates
     tpl := template.Must(template.ParseGlob(filepath.Join("web", "templates", "*.html")))
     return &Web{
@@ -27,16 +33,19 @@ func New() *Web {
         username: os.Getenv("WEB_USERNAME"),
         password: os.Getenv("WEB_PASSWORD"),
         port:     getenv("PORT", "8080"),
+        status:   status,
     }
 }
 
 func (w *Web) RegisterRoutes(mux *http.ServeMux) {
     mux.HandleFunc("/web/login", w.handleLogin)
     mux.HandleFunc("/web/logout", w.handleLogout)
-    mux.HandleFunc("/web/", w.requireAuth(w.handleDashboard))
-    mux.HandleFunc("/web/dashboard", w.requireAuth(w.handleDashboard))
+    mux.HandleFunc("/web/system_status", w.requireAuth(w.handleSystemStatus))
     mux.HandleFunc("/web/process", w.requireAuth(w.handleProcess))
+    mux.HandleFunc("/web/upload", w.requireAuth(w.handleUpload))
     mux.HandleFunc("/web/progress/", w.requireAuth(w.handleProgress))
+    mux.HandleFunc("/web/dashboard", w.requireAuth(w.handleDashboard))
+    mux.HandleFunc("/web/", w.requireAuth(w.handleDashboard))
 }
 
 func (w *Web) render(wr http.ResponseWriter, name string, data any) {
@@ -103,6 +112,42 @@ func (w *Web) handleProcess(wr http.ResponseWriter, r *http.Request) {
     wr.Write(out)
 }
 
+// handleUpload proxies multipart upload from the dashboard to the API endpoint /process_file_upload
+func (w *Web) handleUpload(wr http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost { wr.WriteHeader(http.StatusMethodNotAllowed); return }
+    // Ensure we can read multipart
+    if err := r.ParseMultipartForm(64 << 20); err != nil { http.Error(wr, "invalid multipart form", 400); return }
+
+    var b bytes.Buffer
+    mw := multipart.NewWriter(&b)
+
+    // Copy file part
+    file, hdr, err := r.FormFile("file")
+    if err != nil { http.Error(wr, "missing file", 400); return }
+    defer file.Close()
+    fw, err := mw.CreateFormFile("file", hdr.Filename)
+    if err != nil { http.Error(wr, "upload error", 500); return }
+    if _, err := io.Copy(fw, file); err != nil { http.Error(wr, "upload error", 500); return }
+
+    // Copy other fields
+    for _, k := range []string{"user_name", "ai_engine", "text_only"} {
+        if v := r.FormValue(k); v != "" {
+            _ = mw.WriteField(k, v)
+        }
+    }
+    _ = mw.Close()
+
+    url := fmt.Sprintf("http://127.0.0.1:%s/process_file_upload", w.port)
+    req, _ := http.NewRequest(http.MethodPost, url, &b)
+    req.Header.Set("Content-Type", mw.FormDataContentType())
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil { http.Error(wr, "request failed", 500); return }
+    defer resp.Body.Close()
+    wr.Header().Set("Content-Type", "application/json")
+    wr.WriteHeader(resp.StatusCode)
+    io.Copy(wr, resp.Body)
+}
+
 func (w *Web) handleProgress(wr http.ResponseWriter, r *http.Request) {
     jobID := strings.TrimPrefix(r.URL.Path, "/web/progress/")
     url := fmt.Sprintf("http://127.0.0.1:%s/progress_spec/%s", w.port, jobID)
@@ -111,6 +156,24 @@ func (w *Web) handleProgress(wr http.ResponseWriter, r *http.Request) {
     defer resp.Body.Close()
     wr.Header().Set("Content-Type", "application/json")
     io.Copy(wr, resp.Body)
+}
+
+func (w *Web) handleSystemStatus(wr http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        wr.WriteHeader(http.StatusMethodNotAllowed)
+        return
+    }
+    if w.status == nil {
+        http.Error(wr, "status checker not configured", http.StatusServiceUnavailable)
+        return
+    }
+    ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
+    defer cancel()
+    summary := w.status.Summary(ctx)
+    wr.Header().Set("Content-Type", "application/json")
+    enc := json.NewEncoder(wr)
+    enc.SetIndent("", "")
+    _ = enc.Encode(summary)
 }
 
 func getenv(k, d string) string { if v := os.Getenv(k); v != "" { return v }; return d }

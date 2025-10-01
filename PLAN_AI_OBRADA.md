@@ -169,6 +169,9 @@ Ovaj dokument definira arhitekturu, pravila i korake implementacije servisa za o
   - (Opcionalno) lokalni paralelizam po modelu: `MAX_INFLIGHT_OPENAI_GPT41=4`, `MAX_INFLIGHT_OPENAI_GPT4O=4`, ...
 - Storage/queue:
   - `REDIS_URL=redis://...`, `RESULT_STORE=postgres|s3`, `FILES_BASE=file:///mnt/docs`
+  - Upload/Local results:
+    - `UPLOAD_DIR` (default `./uploads`)
+    - `RESULT_DIR` (default `./uploads/results`)
 
 ## Docker Compose (skica)
 ```yaml
@@ -207,6 +210,7 @@ services:
 - `internal/ai/openai.go`, `internal/ai/anthropic.go` – provider implementacije.
 - `internal/worker/worker.go` – orchestracija pokušaja, timeouti, idempotency, metrika hookovi.
 - `internal/model/types.go` – `Job`, `Result`, `Usage`, error klasifikacija.
+- `internal/orchestrator/localsave.go` – lokalno spremanje agregiranog teksta za upload poslove.
 
 ## Pseudokôd: worker loop i failover
 ```go
@@ -324,6 +328,10 @@ for msg := range stream.ConsumerGroup("jobs:ai:pages", "workers:images") {
   - Dodan `.env.example` s komentarima za sve varijable (brzo popunjavanje lokalnih vrijednosti)
   - Compose: uklonjen host port mapping za Redis (koristi se unutarnji DNS `redis`) da se izbjegnu konflikti porta 6379
   - Compose: `app` host port parametriziran preko `HOST_PORT` (default 8080) radi izbjegavanja konflikata
+  - Dev hot‑reload: dodan dev entrypoint (`/app/dev_entrypoint.sh`) koji prati promjene u `web/templates` i `.env` te restartira servis uz re‑source env‑a
+  - Hot‑reload mountovi: `./web:/app/web`, `./.env:/app/.env:ro`, `./bin:/app/bin` (binarni se učitava iz volume‑a)
+  - Builder servis + skripta: `builder` (golang:bookworm) i `scripts/rebuild_in_container.sh` za rebuild samo binara bez rebuilda slike; nakon builda radi `docker compose restart app`
+  - Fail‑fast: ako nema binara `/app/bin/aidispatcher`, servis se ne pokreće (jasna poruka); prvi build pokrenuti preko `./scripts/rebuild_in_container.sh`
 - [x] Dispatcher fallback:
   - Proširen multi‑model fallback: unutar providera pokušava i sekundarni model i na transient greškama (ne samo 429)
   - Dodana fast‑model ruta kada payload sadrži `force_fast=true` (pokušaj fast modela primarnog pa sekundarnog providera)
@@ -347,6 +355,83 @@ for msg := range stream.ConsumerGroup("jobs:ai:pages", "workers:images") {
 - [ ] Axiom: dodati strukturirana polja (job_id, provider, model, attempt, duration).
 - [x] Health i metrics: dodati `/metrics` (Prometheus) i osnovne metrike (provider requests, latencije, retry/DLQ, depth)
 
+## Ažuriranja 2025-09-30 (UI + Upload flow)
+- Orchestrator:
+  - Dodan POST guard na `POST /process_file_junior_call` (samo POST).
+  - Novi endpoint `POST /process_file_upload` (multipart) – dashboard upload bez S3; spremanje lokalno (`UPLOAD_DIR`) i enqueue u isti worker pipeline.
+  - Novi endpoint `GET /download_result/{job_id}` – download agregiranog rezultata za poslove s izvorom `upload`.
+  - Agregacija rezultata: za `source=upload` sprema lokalno (`RESULT_DIR`) preko `SaveAggregatedTextToLocal`; za ostalo i dalje S3 (`SaveAggregatedTextToS3`).
+- Web (dashboard):
+  - Novi proxy endpoint `POST /web/upload` koji prosljeđuje na `/process_file_upload`.
+  - UI: dodan drag&drop upload, filtriranje ekstenzija, tekst "Supported: pdf, docx, pptx, vsdx, doc, ppt, txt", odgođeno slanje do klika na Process, bez obrade bez fajla.
+  - Branding/UI: sve label‑e prevedene na engleski; naziv sustava "FileApi".
+- ENV:
+  - `UPLOAD_DIR` (default `./uploads`), `RESULT_DIR` (default `./uploads/results`).
+
+## Ažuriranja 2025-10-01 (File Type Detection + LibreOffice Conversion)
+- **File Type Detector** (`internal/filetype/detector.go`):
+  - Implementirana detekcija tipa fajla putem magic bytes (ne oslanja se na ekstenziju)
+  - Koristi `github.com/gabriel-vasile/mimetype` library za preciznu detekciju MIME tipova
+  - Podržani formati:
+    - **PDF**: `application/pdf`
+    - **Modern Office (ZIP-based)**: DOCX, XLSX, PPTX, VSDX, ODT, ODS, ODP
+    - **Legacy Office (OLE-based)**: DOC, XLS, PPT, VSD
+    - **Text formati**: TXT, HTML, XML, JSON, RTF
+    - **Slike**: JPEG, PNG, GIF, BMP, TIFF, WebP
+  - Posebna logika za prepoznavanje:
+    - ZIP-based Office formati (DOCX/XLSX/PPTX detektirani kao ZIP) → fallback na ekstenziju
+    - OLE/CFB-based Office formati (DOC/XLS/PPT detektirani kao `application/x-ole-storage`) → fallback na ekstenziju
+  - API: `Detect(filePath) (*FileTypeInfo, error)` vraća MIME tip, ekstenziju, i flagove (`Supported`, `IsText`, `NeedsOCR`)
+
+- **LibreOffice Converter** (`internal/converter/libreoffice.go`):
+  - Automatska konverzija Office dokumenata u PDF prije obrade
+  - Worker pool s konfigurabilan brojem paralelnih konverzija (`LIBREOFFICE_MAX_WORKERS`, default: 4)
+  - LibreOffice headless server na portu 8100 (konfigurabilan via `LIBREOFFICE_PORT`)
+  - Timeout zaštita (default 180s po konverziji)
+  - Detekcija password-protected dokumenata (vraća `IsProtected=true` bez pokušaja konverzije)
+  - Graceful initialization s fallback-om (servis radi i bez LibreOffice-a, ali ne podržava Office formate)
+  - Podržani formati za konverziju: DOC, DOCX, XLS, XLSX, PPT, PPTX, ODT, ODS, ODP, VSD, VSDX, RTF, HTML
+
+- **Orchestrator integracija**:
+  - `handleProcessUpload`: Prije obrade uploadanog fajla:
+    1. Detektuje tip fajla putem `FileType.Detect()`
+    2. Provjerava da li je podržan format (`!fileInfo.Supported` → HTTP 400)
+    3. Ako je Office format (ne-PDF i ne-text) → automatska konverzija u PDF pomoću LibreOffice
+    4. Konvertirani PDF sprema se kao `{jobID}_converted.pdf` u istom direktoriju
+    5. Dalja obrada (page count, AI/MuPDF pipeline) radi s PDF verzijom
+  - `handleProcess` (S3 putanje): TODO marker dodan za budući download+konverziju S3 dokumenata
+  - Status tracking:
+    - Progress 5% dok traje konverzija ("converting to PDF")
+    - Metadata sadrži `original_mime` za praćenje izvornog formata
+    - Konverzijske greške vraćaju status `failed` s detaljnom porukom
+
+- **Main.go inicijalizacija** (`cmd/app/main.go`):
+  - LibreOffice converter inicijalizacija pri startupu:
+    - Provjera da li je LibreOffice instaliran (`libreoffice --version`)
+    - Pokretanje headless servera s UNO protokolom
+    - Health check s test konverzijom
+    - Log poruke: "LibreOffice converter initialized successfully" ili warning ako nije dostupan
+  - File type detector inicijalizacija (bez external dependencies)
+  - Dependency injection u Orchestrator Dependencies (`Converter`, `FileType`)
+  - Graceful shutdown LibreOffice servera pri gašenju aplikacije
+
+- **ENV varijable**:
+  - `LIBREOFFICE_PORT` (default: 8100) - port za LibreOffice headless server
+  - `LIBREOFFICE_MAX_WORKERS` (default: 4) - max broj paralelnih konverzija
+
+- **Dependencies**:
+  - Dodana `github.com/gabriel-vasile/mimetype v1.4.3` u `go.mod`
+
+- **Log poruke**:
+  - File type detection: `detected file type`, `ZIP detected, checking extension`, `OLE storage detected, checking extension`
+  - Conversion: `converting to PDF with LibreOffice`, `conversion successful`, `conversion failed`
+  - LibreOffice: `initializing LibreOffice converter`, `LibreOffice server started`, `LibreOffice converter initialized`
+
+Open TODOs za ovaj dio:
+- Dashboard: dodati “Download result” gumb kad je `status=success` i `source=upload` (zove `/download_result/{job_id}`).
+- Validacije: tip i veličina fajla (client+server), cleanup upload direktorija, rate‑limit upload endpointa.
+- Metrike: broj upload poslova, veličina upload‑ova, trajanje upload pipelinea.
+
 ---
 
 Napomena: Binarne datoteke ne stavljati u Redis. Koristiti samo reference (lokalni `file://` ili objektna pohrana poput S3) i hash za integritet.
@@ -356,13 +441,16 @@ Napomena: Binarne datoteke ne stavljati u Redis. Koristiti samo reference (lokal
 Ovaj odjeljak definira hibridni Orchestrator koji prima zahtjeve od GhostServer‑a (POST `/process_file_junior_call`), odlučuje koje stranice obraditi lokalno (MuPDF) a koje preko AI Dispatchera, ažurira progres i pohranjuje rezultate. Orchestrator i Dispatcher rade u istom servisu, ali su jasno odvojeni paketi/binariji za kasniji split.
 
 ### API Endpoints
-- POST `/process_file_junior_call`: prihvaća zahtjev za obradu jednog dokumenta (pipeline: Goling).
-- POST `/web/process`: dashboard endpoint koji poziva isti Goling pipeline (proxy prema API‑ju uz basic auth), bez dupliranja logike.
+- POST `/process_file_junior_call`: prihvaća zahtjev za obradu jednog dokumenta (pipeline preko S3/URL reference).
+- POST `/process_file_upload`: dashboard upload (multipart) – spremi lokalno (UPLOAD_DIR) i enqueuea kroz isti worker pipeline (bez S3 I/O).
+- GET `/download_result/{job_id}`: vraća agregirani rezultat kao datoteku za poslove s izvorom `upload`.
+- POST `/web/process`: dashboard endpoint – proxy prema `/process_file_junior_call` (JSON request bez file‑a).
+- POST `/web/upload`: dashboard endpoint – proxy prema `/process_file_upload` (multipart upload).
 - GET `/progress_spec/{job_id_or_file_id}`: vraća status i progres obrade.
 - GET `/health`, `/health_check`, `/status`: healthz.
- - POST `/webhook/cancel_job`: otkazivanje posla; zapis u Redis cancel set i ažuriranje statusa.
- - POST `/internal/page_done?job_id=&page_id=`: dispatcher šalje završenu AI stranicu (body: `{text,provider,model}`).
- - POST `/internal/page_failed?job_id=&page_id=`: dispatcher označi stranicu kao fail (orchestrator radi MuPDF fallback).
+- POST `/webhook/cancel_job`: otkazivanje posla; zapis u Redis cancel set i ažuriranje statusa.
+- POST `/internal/page_done?job_id=&page_id=`: dispatcher šalje završenu AI stranicu (body: `{text,provider,model}`).
+- POST `/internal/page_failed?job_id=&page_id=`: dispatcher označi stranicu kao fail (orchestrator radi MuPDF fallback).
 
 ### Request schema (usklađeno s postojećim kodom)
 - Polja (GhostServer + legacy):
@@ -400,6 +488,24 @@ Ovaj odjeljak definira hibridni Orchestrator koji prima zahtjeve od GhostServer�
 5. Paralelno (lokalno) procesuirati MuPDF stranice; rezultati idu u privremenu pohranu.
 6. Agregacija: čekati AI rezultate (poll/push), objediniti s MuPDF rezultatima u finalni tekst i zapisati u S3 (bez lokalne baze). Status metadata: `result_s3_url`, `result_text_len`.
 
+### Tok za POST /process_file_upload (dashboard upload)
+1. Validacija multipart zahtjeva i polja `file`, `user_name`, `ai_engine`, `text_only`.
+2. Spremanje datoteke lokalno u `UPLOAD_DIR` (default `./uploads`) i generiranje `file://` reference; `status.Metadata.source = "upload"` i `status.Metadata.file_local`.
+3. **File type detection i konverzija** (novo od 2025-10-01):
+   - Detektuje tip fajla putem magic bytes (`FileType.Detect()`)
+   - Provjerava da li je format podržan (inače vraća HTTP 400 sa opisom greške)
+   - Ako je Office format (DOC/DOCX/XLS/XLSX/PPT/PPTX/ODT/ODS/ODP):
+     - Pokreće LibreOffice konverziju u PDF (`Converter.ConvertToPDF()`)
+     - Konvertirani PDF: `{jobID}_converted.pdf` u istom direktoriju
+     - Status: progress 5%, message "converting to PDF"
+     - Metadata: `original_mime` sadrži MIME tip izvornog dokumenta
+   - Ako konverzija ne uspije → status `failed` sa detaljnom greškom
+   - PDF i text formati preskaču konverziju
+4. Brojanje stranica i selekcija (isti selektor kao i S3/URL put, ali sada radi s PDF verzijom dokumenta).
+5. Enqueue AI stranica u isti Redis Stream (`jobs:ai:pages`) – worker pipeline je identičan.
+6. Agregacija: objediniti rezultate i, za upload poslove, spremiti agregirani tekst lokalno (`RESULT_DIR`, default `./uploads/results`). U status dodati `result_local_path` i `result_text_len` te označiti `success`.
+7. Dashboard može preuzeti rezultat preko `GET /download_result/{job_id}`.
+
 ## Pokretanje servisa (Docker Compose)
 - Preduvjeti:
   - Docker i Docker Compose instalirani.
@@ -411,6 +517,11 @@ Ovaj odjeljak definira hibridni Orchestrator koji prima zahtjeve od GhostServer�
   - Servisi:
     - `redis`: Redis 7 na portu 6379
     - `app`: Orchestrator+Dispatcher na portu 8080
+  - Dev hot‑reload workflow (bez rebuilda slike):
+    - Binarni: `./scripts/rebuild_in_container.sh` (builder kompajlira u `./bin/aidispatcher` i restarta `app`)
+    - Predlošci: promjene u `web/templates` se detektiraju i servis se automatski restartira
+    - `.env`: promjene u `.env` se detektiraju i env se ponovno učitava kroz dev entrypoint
+    - Napomena: bez binara (`./bin/aidispatcher`) servis fail‑fast – prvo pokrenuti rebuild skriptu
 
 - Bitne varijable (mogu se postaviti u `docker-compose.yml` ili runtime):
   - HTTP/Worker:
@@ -454,6 +565,12 @@ Ovaj odjeljak definira hibridni Orchestrator koji prima zahtjeve od GhostServer�
 - `internal/store/status_redis.go`: Redis status store; `internal/store/page_redis.go`: per‑stranica tekst i agregacija.
 - `internal/ai/*`: klijenti za OpenAI i Anthropic (HTTP pozivi, 429 mapiranje).
 - `internal/logger/logger.go`: file rotacija + Axiom; `internal/config/env.go`: centralni config.
+  
+### UI/Dashboard (promjene)
+- Dashboard preuređen i preveden na engleski (branding: FileApi); dodan desni stupac s "System Status" i "Live Metrics" (placeholderi).
+- Dodan drag‑and‑drop okvir s "Choose File" (UI samo), prikaz odabranog naziva/veličine i popis podržanih formata: `pdf, docx, pptx, vsdx, doc, ppt, txt`.
+- Prihvaćeni tipovi ograničeni putem `accept=".pdf,.docx,.pptx,.vsdx,.doc,.ppt,.txt"`.
+- Klik na "Process" tek tada šalje upload na `/web/upload` (nema obrade bez odabranog fajla). Odgovor prikazan u Monitoring pre‑bloku i auto‑popunjava `job_id` polje.
 7. Ažurirati Redis status: `processing` → `success` ili `failed` + poruka. Emitirati progres (0–100%) po milestoneovima: preuzimanje, analiza, enqueuing AI, završetak MuPDF, pristizanje AI rezultata, spajanje, spremanje.
 
 ### Progres i status

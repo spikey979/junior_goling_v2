@@ -35,3 +35,10 @@ func (a *redisStatusAdapter) Get(ctx context.Context, jobID string) (Status, boo
     }, true, nil
 }
 
+func (a *redisStatusAdapter) SetFileJobMapping(ctx context.Context, fileID, jobID string) error {
+    return a.s.SetFileJobMapping(ctx, fileID, jobID)
+}
+
+func (a *redisStatusAdapter) GetJobByFileID(ctx context.Context, fileID string) (string, error) {
+    return a.s.GetJobByFileID(ctx, fileID)
+}

@@ -1,66 +1,659 @@
 <!DOCTYPE html>
-<html>
+<html lang="hr">
 <head>
   <meta charset="utf-8" />
-  <title>AI Orchestrator – Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FileApi – Dashboard</title>
   <style>
-    body { font-family: sans-serif; margin: 24px; }
-    header { display:flex; justify-content: space-between; align-items:center; }
-    main { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
-    form { display:grid; gap:10px; border:1px solid #ddd; padding:16px; border-radius:8px; }
-    input, select { padding:8px; }
-    pre { background:#f8f8f8; padding:12px; border-radius:6px; }
+    :root {
+      --primary-color: #2563eb;
+      --primary-gradient: linear-gradient(135deg, #2563eb 0%, #3b82f6 50%, #1d4ed8 100%);
+      --border-color: #e5e7eb;
+      --text-color: #374151;
+      --text-muted: #6b7280;
+      --card-bg: #ffffff;
+      --soft-surface: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+      --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+      --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+      --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+      --radius: 12px;
+      --radius-sm: 8px;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      background: linear-gradient(135deg, #f8fafc 0%, #eef2f7 100%);
+      color: var(--text-color);
+      line-height: 1.6;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    .header {
+      background: linear-gradient(180deg, rgba(37,99,235,0.90), rgba(37,99,235,0.80));
+      color: white;
+      padding: 0.75rem 0;
+      box-shadow: var(--shadow-lg);
+      position: sticky; top: 0; z-index: 10;
+    }
+    .header-content { max-width: 1200px; margin: 0 auto; padding: 0 1.5rem; display: flex; justify-content: space-between; align-items: center; }
+    .header h1 { font-size: 1.5rem; font-weight: 700; display: flex; align-items: center; gap: .5rem; }
+    .logout-btn { background: rgba(255,255,255,0.15); color: #fff; padding: .5rem 1rem; border-radius: 999px; text-decoration: none; transition: all .15s ease; }
+    .logout-btn:hover { background: rgba(255,255,255,0.25); transform: translateY(-1px); }
+
+    .container { max-width: 1400px; margin: 2rem auto; padding: 0 1.5rem; display: grid; grid-template-columns: 1fr 0.5fr; gap: 2rem; }
+    @media (max-width: 900px) { .container { grid-template-columns: 1fr; } }
+    .right-col { display: grid; gap: 1.5rem; align-content: start; }
+
+    .card { background: var(--card-bg); border: 1px solid var(--border-color); border-radius: var(--radius); box-shadow: var(--shadow-sm); overflow: hidden; transition: transform .15s ease, box-shadow .15s ease; }
+    .card:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); }
+    .card-header { padding: 1rem 1.25rem; border-bottom: 1px solid var(--border-color); background: var(--soft-surface); display: flex; justify-content: space-between; align-items: center; }
+    .card-header h2 { font-size: 1.1rem; }
+    .card-body { padding: 1.25rem; }
+
+    .form { display: grid; gap: 1rem; }
+    .form-group label { display: block; margin-bottom: .4rem; color: #111827; font-weight: 600; font-size: .9rem; }
+    .form-group input, .form-group select { width: 100%; padding: .75rem 1rem; border: 2px solid var(--border-color); border-radius: var(--radius-sm); font-size: 1rem; transition: border-color .15s ease, box-shadow .15s ease; }
+    .form-group input:focus, .form-group select:focus { outline: none; border-color: var(--primary-color); box-shadow: 0 0 0 3px rgba(37,99,235,0.12); }
+    .checkbox { display: flex; align-items: center; gap: .5rem; color: var(--text-muted); }
+
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: .5rem; padding: .75rem 1.25rem; border: none; border-radius: var(--radius-sm); font-weight: 600; cursor: pointer; transition: transform .15s ease, box-shadow .15s ease; text-decoration: none; }
+    .btn-primary { background: var(--primary-gradient); color: white; box-shadow: var(--shadow-sm); }
+    .btn-primary:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); }
+
+    .helper { color: var(--text-muted); font-size: .9rem; margin-top: .5rem; }
+    pre { background: #0b1220; color: #e5e7eb; padding: 1rem; border-radius: var(--radius-sm); overflow: auto; border: 1px solid #172038; }
+
+    /* Upload (drag & drop) */
+    .upload-section { position: relative; border: 2px dashed var(--border-color); border-radius: var(--radius); padding: 1.25rem; text-align: center; background: var(--soft-surface); transition: all .15s ease; }
+    .upload-section:hover, .upload-section.dragover { border-color: var(--primary-color); transform: translateY(-1px); box-shadow: var(--shadow-sm); }
+    .upload-section.dragover { background: rgba(37,99,235,0.08); }
+    .upload-icon { font-size: 2rem; opacity: 0.8; margin-bottom: .5rem; }
+    .upload-text { color: var(--text-muted); margin-bottom: .75rem; }
+    .upload-supported { color: var(--text-muted); font-size: .85rem; margin-bottom: .75rem; }
+    .file-input { display: none; }
+    .file-input-label { background: var(--primary-gradient); color: #fff; padding: .6rem 1.25rem; border-radius: var(--radius-sm); cursor: pointer; font-weight: 600; box-shadow: var(--shadow-sm); display: inline-block; }
+    .file-input-label:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); }
+    .file-selected { margin-top: .5rem; color: var(--text-muted); font-size: .9rem; }
+    .error-msg { margin-top: .5rem; color: #b91c1c; font-weight: 600; }
+    .status-grid { display: grid; gap: .6rem; }
+    .status-row { display: flex; align-items: center; justify-content: space-between; padding: .4rem .2rem; border-bottom: 1px solid var(--border-color); }
+    .status-row:last-child { border-bottom: none; }
+    .status-name { font-weight: 600; color: var(--text-color); }
+    .status-badge { display: inline-flex; align-items: center; gap: .35rem; font-weight: 600; }
+    .status-badge::before { content: '●'; font-size: .6rem; }
+    .status-ok { color: #047857; }
+    .status-ok::before { color: #10b981; }
+    .status-fail { color: #b91c1c; }
+    .status-fail::before { color: #ef4444; }
+    .status-pending { color: var(--text-muted); }
+    .status-pending::before { color: #9ca3af; animation: pulse 1.2s ease-in-out infinite; }
+    @keyframes pulse {
+      0% { opacity: .4; }
+      50% { opacity: 1; }
+      100% { opacity: .4; }
+    }
+
+    /* Progress section */
+    .progress-section { margin-top: 1.5rem; padding: 1rem; background: var(--card-bg); border-radius: var(--radius); border: 1px solid var(--border-color); display: none; }
+    .progress-bar-container { background: var(--border-color); height: 24px; border-radius: var(--radius-sm); overflow: hidden; margin-bottom: .75rem; position: relative; }
+    .progress-bar { height: 100%; background: var(--primary-gradient); transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; color: white; font-weight: 600; font-size: 0.85rem; }
+    .progress-info { display: flex; justify-content: space-between; margin-bottom: .5rem; }
+    .progress-status { color: var(--text-color); font-weight: 600; }
+    .progress-timer { color: var(--text-muted); font-family: monospace; }
+    .result-area { margin-top: 1rem; }
+    .result-textarea { width: 100%; min-height: 400px; padding: 1rem; background: #0b1220; color: #e5e7eb; border: 1px solid var(--border-color); border-radius: var(--radius-sm); font-family: 'Courier New', monospace; font-size: .9rem; resize: vertical; }
   </style>
   </head>
 <body>
-  <header>
-    <h1>AI Orchestrator – Dashboard</h1>
-    <nav>
-      <a href="/web/logout">Logout</a>
-    </nav>
-  </header>
-  <main>
-    <section>
-      <h2>Pokreni obradu</h2>
-      <form method="post" action="/web/process">
-        <label>File path/URL (S3 ključ ili s3://)
-          <input name="file_path" placeholder="s3://bucket/key.pdf" />
-        </label>
-        <label>Korisnik
-          <input name="user_name" placeholder="user@example.com" />
-        </label>
-        <label>AI engine
-          <select name="ai_engine">
-            <option value="OpenAIEngine">OpenAIEngine</option>
-            <option value="ClaudeEngine">ClaudeEngine</option>
-            <option value="JuniorEngine">JuniorEngine</option>
-          </select>
-        </label>
-        <label>
-          <input type="checkbox" name="text_only" /> Samo MuPDF (bez AI)
-        </label>
-        <button type="submit">Procesiraj</button>
-      </form>
-      <p>Rezultat poziva bit će prikazan kao JSON odgovor.</p>
+  <div class="header">
+    <div class="header-content">
+      <h1>🚀 FileApi – Dashboard</h1>
+      <a class="logout-btn" href="/web/logout">Logout</a>
+    </div>
+  </div>
+
+  <div class="container">
+    <div class="left-col">
+    <section class="card">
+      <div class="card-header">
+        <h2>📄 Start Processing</h2>
+      </div>
+      <div class="card-body">
+        <form id="upload_form" class="form" method="post" action="/web/process">
+          <div class="form-group">
+            <label for="file_path">File path/URL (S3 key or s3://)</label>
+            <input id="file_path" name="file_path" placeholder="s3://bucket/key.pdf" />
+          </div>
+          <div class="form-group">
+            <label for="user_name">User</label>
+            <input id="user_name" name="user_name" placeholder="user@example.com" />
+          </div>
+          <!-- Drag & Drop Upload (UI + delayed submit on Process) -->
+          <div id="upload_box" class="upload-section" aria-label="Upload file">
+            <div class="upload-icon">📤</div>
+            <div class="upload-text">Drag & drop a file here</div>
+            <div class="upload-supported">Supported: pdf, docx, pptx, vsdx, doc, ppt, txt</div>
+            <input type="file" id="file_input" name="file" class="file-input" accept=".pdf,.docx,.pptx,.vsdx,.doc,.ppt,.txt" />
+            <label for="file_input" class="file-input-label">Choose File</label>
+            <div id="file_selected" class="file-selected" aria-live="polite"></div>
+            <div id="file_error" class="error-msg" style="display:none;"></div>
+          </div>
+          <div class="form-group">
+            <label for="ai_engine">AI engine</label>
+            <select id="ai_engine" name="ai_engine">
+              <option value="OpenAIEngine">OpenAIEngine</option>
+              <option value="ClaudeEngine">ClaudeEngine</option>
+              <option value="JuniorEngine">JuniorEngine</option>
+            </select>
+          </div>
+          <label class="checkbox">
+            <input type="checkbox" name="text_only" /> MuPDF only (no AI)
+          </label>
+          <button id="processBtn" class="btn btn-primary" type="submit">Process</button>
+        </form>
+
+        <!-- Progress Section -->
+        <div id="progress_section" class="progress-section">
+          <div class="progress-info">
+            <span class="progress-status" id="progress_status">Processing...</span>
+            <span class="progress-timer" id="progress_timer">00:00</span>
+          </div>
+          <div class="progress-bar-container">
+            <div class="progress-bar" id="progress_bar" style="width: 0%">0%</div>
+          </div>
+          <div id="progress_message" style="color: var(--text-muted); font-size: 0.9rem; margin-top: 0.5rem;"></div>
+        </div>
+
+        <!-- Result Display Area -->
+        <div id="result_section" class="result-area" style="display:none;">
+          <h3 style="margin-bottom: 0.5rem;">Extracted Text:</h3>
+          <textarea id="result_text" class="result-textarea" readonly placeholder="Processing..."></textarea>
+          <div style="margin-top: 0.5rem; display: flex; justify-content: space-between;">
+            <span id="result_stats" style="color: var(--text-muted); font-size: 0.9rem;"></span>
+            <button id="copy_btn" class="btn btn-primary" onclick="copyResult()" style="padding: 0.4rem 1rem; font-size: 0.9rem;">Copy Text</button>
+          </div>
+        </div>
+      </div>
     </section>
-    <section>
-      <h2>Praćenje</h2>
-      <form onsubmit="ev(event)">
-        <label>Job ID <input id="jid" /></label>
-        <button>Provjeri</button>
-      </form>
-      <pre id="out">(nema podataka)</pre>
-    </section>
-  </main>
+    </div>
+
+    <div class="right-col">
+      <section class="card">
+        <div class="card-header">
+          <h2>🔎 Monitoring</h2>
+        </div>
+        <div class="card-body">
+          <form class="form" onsubmit="ev(event)">
+            <div class="form-group">
+              <label for="jid">Job ID</label>
+              <input id="jid" placeholder="e.g. 7b3f3e3a-..." />
+            </div>
+            <button class="btn btn-primary" type="submit">Check</button>
+          </form>
+          <pre id="out">(no data)</pre>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h2>🖥️ System Status</h2>
+        </div>
+        <div class="card-body">
+          <div class="status-grid" id="system_status">
+            <div class="status-row" data-status="redis">
+              <span class="status-name">Redis</span>
+              <span class="status-badge status-pending">Checking…</span>
+            </div>
+            <div class="status-row" data-status="s3">
+              <span class="status-name">S3 Storage</span>
+              <span class="status-badge status-pending">Checking…</span>
+            </div>
+            <div class="status-row" data-status="libreoffice">
+              <span class="status-name">LibreOffice</span>
+              <span class="status-badge status-pending">Checking…</span>
+            </div>
+            <div class="status-row" data-status="openai">
+              <span class="status-name">OpenAI</span>
+              <span class="status-badge status-pending">Checking…</span>
+            </div>
+            <div class="status-row" data-status="anthropic">
+              <span class="status-name">Anthropic</span>
+              <span class="status-badge status-pending">Checking…</span>
+            </div>
+            <div class="status-row" data-status="mupdf">
+              <span class="status-name">MuPDF</span>
+              <span class="status-badge status-pending">Checking…</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h2>📈 Live Metrics</h2>
+        </div>
+        <div class="card-body">
+          <div class="form" style="grid-template-columns: 1fr 1fr; display: grid; gap: 1rem;">
+            <div class="card" style="padding: 1rem; border-radius: var(--radius-sm);">
+              <div class="helper">Requests/min</div>
+              <div style="font-weight:700; font-size:1.25rem;">—</div>
+            </div>
+            <div class="card" style="padding: 1rem; border-radius: var(--radius-sm);">
+              <div class="helper">Avg latency</div>
+              <div style="font-weight:700; font-size:1.25rem;">—</div>
+            </div>
+            <div class="card" style="padding: 1rem; border-radius: var(--radius-sm);">
+              <div class="helper">Success rate</div>
+              <div style="font-weight:700; font-size:1.25rem;">—</div>
+            </div>
+            <div class="card" style="padding: 1rem; border-radius: var(--radius-sm);">
+              <div class="helper">Errors/min</div>
+              <div style="font-weight:700; font-size:1.25rem;">—</div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
   <script>
+    // Copy result to clipboard
+    function copyResult() {
+      const textarea = document.getElementById('result_text');
+      if(textarea && textarea.value) {
+        navigator.clipboard.writeText(textarea.value).then(() => {
+          const btn = document.getElementById('copy_btn');
+          const originalText = btn.textContent;
+          btn.textContent = 'Copied!';
+          setTimeout(() => { btn.textContent = originalText; }, 2000);
+        });
+      }
+    }
+
     async function ev(e){
       e.preventDefault();
       const jid = document.getElementById('jid').value;
-      const r = await fetch('/progress_spec/'+jid);
+      if(!jid) return;
+      const r = await fetch('/progress_spec/'+encodeURIComponent(jid));
       const t = await r.text();
       document.getElementById('out').textContent = t;
     }
+    // Upload selection and guarded submit
+    (function(){
+      const allowed = [".pdf",".docx",".pptx",".vsdx",".doc",".ppt",".txt"]; 
+      const uploadBox = document.getElementById('upload_box');
+      const fileInput = document.getElementById('file_input');
+      const fileSelected = document.getElementById('file_selected');
+      const fileError = document.getElementById('file_error');
+      const form = document.getElementById('upload_form');
+      const userInput = document.getElementById('user_name');
+      const outPre = document.getElementById('out');
+      const jidInput = document.getElementById('jid');
+      let selectedFile = null;
+
+      if(!uploadBox || !form){ return; }
+
+      function extOK(name){
+        const lower = (name||'').toLowerCase();
+        return allowed.some(e => lower.endsWith(e));
+      }
+      function showSelected(file){
+        fileSelected.textContent = file ? `Selected: ${file.name} (${Math.round(file.size/1024)} KB)` : '';
+      }
+      function showError(msg){
+        if(!msg){ fileError.style.display='none'; fileError.textContent=''; return; }
+        fileError.style.display='block'; fileError.textContent = msg;
+      }
+
+      // Prevent default drag behaviors on document
+      document.addEventListener('dragover', (e) => {
+        e.preventDefault();
+      });
+      document.addEventListener('drop', (e) => {
+        e.preventDefault();
+      });
+
+      // Drag & drop handlers for upload box
+      uploadBox.addEventListener('dragenter', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        uploadBox.classList.add('dragover');
+      });
+
+      uploadBox.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        uploadBox.classList.add('dragover');
+      });
+
+      uploadBox.addEventListener('dragleave', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        // Check if we're actually leaving the upload box
+        if (e.target === uploadBox || !uploadBox.contains(e.relatedTarget)) {
+          uploadBox.classList.remove('dragover');
+        }
+      });
+
+      uploadBox.addEventListener('drop', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        uploadBox.classList.remove('dragover');
+
+        // Debug logging
+        console.log('Drop event:', e);
+        console.log('dataTransfer:', e.dataTransfer);
+
+        if (!e.dataTransfer) {
+          console.error('No dataTransfer object');
+          showError('Browser does not support file drop');
+          return;
+        }
+
+        // Try multiple methods to get files
+        let fileToProcess = null;
+
+        // Method 1: Try files property
+        if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+          console.log('Got file from dataTransfer.files');
+          fileToProcess = e.dataTransfer.files[0];
+        }
+        // Method 2: Try items property
+        else if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+          console.log('Trying dataTransfer.items...');
+          for (let i = 0; i < e.dataTransfer.items.length; i++) {
+            const item = e.dataTransfer.items[i];
+            console.log('Item', i, ':', item.kind, item.type);
+
+            if (item.kind === 'file') {
+              const file = item.getAsFile();
+              if (file) {
+                console.log('Got file from item.getAsFile()');
+                fileToProcess = file;
+                break;
+              }
+            }
+          }
+        }
+
+        if (!fileToProcess) {
+          console.error('Could not extract file from drop event');
+          console.log('dataTransfer.files:', e.dataTransfer.files);
+          console.log('dataTransfer.items:', e.dataTransfer.items);
+          console.log('dataTransfer.types:', e.dataTransfer.types);
+          showError('Could not process dropped file. Try using the Choose File button.');
+          return;
+        }
+
+        console.log('File detected:', fileToProcess.name, fileToProcess.size, fileToProcess.type);
+
+        if (!extOK(fileToProcess.name)) {
+          showError('Unsupported file type. Allowed: ' + allowed.join(', '));
+          return;
+        }
+
+        selectedFile = fileToProcess;
+        showSelected(fileToProcess);
+        showError('');
+
+        // Try to sync with file input (for visual consistency)
+        try {
+          const dt = new DataTransfer();
+          dt.items.add(fileToProcess);
+          fileInput.files = dt.files;
+        } catch (err) {
+          // Some browsers don't support DataTransfer, that's OK
+          console.log('Could not sync file input:', err);
+        }
+      });
+
+      // Choose file
+      fileInput.addEventListener('change', ()=>{
+        const f = fileInput.files && fileInput.files[0];
+        if(!f) { selectedFile=null; showSelected(null); return; }
+        if(!extOK(f.name)) { selectedFile=null; showSelected(null); showError('Unsupported file type. Allowed: ' + allowed.join(', ')); fileInput.value=''; return; }
+        selectedFile = f; showSelected(f); showError('');
+      });
+
+      // Processing state management
+      let processingJobId = null;
+      let pollingInterval = null;
+      let timerInterval = null;
+      let startTime = null;
+
+      function startTimer() {
+        startTime = Date.now();
+        const timerEl = document.getElementById('progress_timer');
+        timerInterval = setInterval(() => {
+          const elapsed = Math.floor((Date.now() - startTime) / 1000);
+          const minutes = Math.floor(elapsed / 60);
+          const seconds = elapsed % 60;
+          timerEl.textContent = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+        }, 100);
+      }
+
+      function stopTimer() {
+        if(timerInterval) {
+          clearInterval(timerInterval);
+          timerInterval = null;
+        }
+      }
+
+      function updateProgress(progress, status, message) {
+        const progressBar = document.getElementById('progress_bar');
+        const progressStatus = document.getElementById('progress_status');
+        const progressMessage = document.getElementById('progress_message');
+
+        progressBar.style.width = progress + '%';
+        progressBar.textContent = progress + '%';
+
+        if(status) progressStatus.textContent = status;
+        if(message) progressMessage.textContent = message;
+      }
+
+      async function pollJobStatus(jobId) {
+        try {
+          const resp = await fetch(`/progress_spec/${jobId}`);
+          if(!resp.ok) return;
+
+          const data = await resp.json();
+
+          // Update progress
+          const progress = data.progress || 0;
+          const status = data.status || 'processing';
+          const message = data.message || '';
+
+          updateProgress(progress,
+            status === 'success' ? 'Completed!' :
+            status === 'failed' ? 'Failed' :
+            status === 'processing' ? 'Processing...' :
+            'Queued',
+            message
+          );
+
+          // Check if completed
+          if(status === 'success' || status === 'failed') {
+            stopTimer();
+            if(pollingInterval) {
+              clearInterval(pollingInterval);
+              pollingInterval = null;
+            }
+
+            // If success, fetch the result
+            if(status === 'success') {
+              const metadata = data.metadata || {};
+              const source = metadata.source;
+
+              console.log('Job succeeded, metadata:', metadata);
+              console.log('Source:', source);
+
+              if(source === 'upload') {
+                // Fetch result text
+                const resultResp = await fetch(`/download_result/${jobId}`);
+                console.log('Download result response status:', resultResp.status);
+
+                if(resultResp.ok) {
+                  const resultText = await resultResp.text();
+                  const resultTextarea = document.getElementById('result_text');
+                  const resultSection = document.getElementById('result_section');
+                  const resultStats = document.getElementById('result_stats');
+
+                  console.log('Got result text, length:', resultText.length);
+
+                  resultTextarea.value = resultText;
+                  resultSection.style.display = 'block';
+
+                  // Show stats
+                  const charCount = resultText.length;
+                  const pageCount = metadata.total_pages || 0;
+                  const processingTime = metadata.processing_time ? metadata.processing_time.toFixed(1) : '0';
+                  resultStats.textContent = `${charCount.toLocaleString()} characters | ${pageCount} pages | ${processingTime}s`;
+                } else {
+                  console.error('Failed to download result, status:', resultResp.status);
+                  // Show result section anyway with error message
+                  const resultSection = document.getElementById('result_section');
+                  const resultTextarea = document.getElementById('result_text');
+                  resultSection.style.display = 'block';
+                  resultTextarea.value = 'Error: Could not download result text. Please check console for details.';
+                }
+              } else {
+                // For non-upload sources, still show something
+                console.log('Non-upload source, showing completion message');
+                const resultSection = document.getElementById('result_section');
+                const resultTextarea = document.getElementById('result_text');
+                resultSection.style.display = 'block';
+                resultTextarea.value = `Processing completed successfully!\n\nJob ID: ${jobId}\nStatus: ${status}\nMessage: ${message}\n\nNote: Result display is only available for uploaded files.`;
+              }
+            } else if(status === 'failed') {
+              showError('Processing failed: ' + message);
+            }
+          }
+        } catch(err) {
+          console.error('Poll error:', err);
+        }
+      }
+
+      // Intercept submit: require file, then POST to /web/upload
+      form.addEventListener('submit', async (e)=>{
+        e.preventDefault();
+        if(!selectedFile){ showError('Please choose a file before processing.'); return; }
+        const userName = (userInput && userInput.value ? userInput.value.trim() : '');
+        if(!userName){ showError('Please enter a user name.'); if(userInput){ userInput.focus(); } return; }
+
+        const btn = document.getElementById('processBtn');
+        const progressSection = document.getElementById('progress_section');
+        const resultSection = document.getElementById('result_section');
+        const resultTextarea = document.getElementById('result_text');
+
+        // Reset UI
+        btn.disabled = true;
+        progressSection.style.display = 'block';
+        resultSection.style.display = 'none';
+        resultTextarea.value = '';
+        updateProgress(0, 'Uploading...', 'Sending file to server');
+        startTimer();
+
+        try {
+          const fd = new FormData();
+          fd.append('file', selectedFile);
+          fd.append('user_name', userName);
+          fd.append('ai_engine', document.getElementById('ai_engine').value || '');
+          const textOnly = form.querySelector('input[name="text_only"]').checked;
+          fd.append('text_only', textOnly ? 'true' : 'false');
+
+          const resp = await fetch('/web/upload', { method: 'POST', body: fd });
+          if(!resp.ok){
+            const errText = await resp.text();
+            showError(errText || 'Upload failed');
+            progressSection.style.display = 'none';
+            stopTimer();
+            btn.disabled = false;
+            return;
+          }
+
+          const result = await resp.json();
+          if(result.job_id) {
+            processingJobId = result.job_id;
+            jidInput.value = result.job_id;
+
+            // Start polling for status
+            updateProgress(5, 'Processing...', 'Job created, starting processing');
+            pollingInterval = setInterval(() => {
+              pollJobStatus(processingJobId);
+            }, 500); // Poll every 500ms
+
+            // Initial poll
+            pollJobStatus(processingJobId);
+          }
+
+          showError('');
+        } catch (err) {
+          showError('Upload failed: ' + (err && err.message ? err.message : String(err)));
+          progressSection.style.display = 'none';
+          stopTimer();
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    })();
+
+    // System status polling
+    (function(){
+      const rows = document.querySelectorAll('#system_status [data-status]');
+      if(!rows.length) { return; }
+
+      function updateRow(key, payload){
+        const row = document.querySelector(`#system_status [data-status="${key}"]`);
+        if(!row) { return; }
+        const badge = row.querySelector('.status-badge');
+        if(!badge) { return; }
+        badge.classList.remove('status-ok','status-fail','status-pending');
+        if(payload && payload.ok){
+          badge.classList.add('status-ok');
+          badge.textContent = payload.message || 'Available';
+        } else {
+          badge.classList.add('status-fail');
+          badge.textContent = (payload && payload.message) ? payload.message : 'Unavailable';
+        }
+      }
+
+      async function loadStatus(){
+        try {
+          const resp = await fetch('/web/system_status');
+          if(!resp.ok){ throw new Error('HTTP '+resp.status); }
+          const data = await resp.json();
+          updateRow('redis', data.redis);
+          updateRow('s3', data.s3);
+          updateRow('libreoffice', data.libreoffice);
+          updateRow('openai', data.openai);
+          updateRow('anthropic', data.anthropic);
+          updateRow('mupdf', data.mupdf);
+        } catch (err) {
+          ['redis','s3','libreoffice','openai','anthropic','mupdf'].forEach(key => {
+            updateRow(key, { ok: false, message: 'Error' });
+          });
+        }
+      }
+
+      function markPending(){
+        rows.forEach(row => {
+          const badge = row.querySelector('.status-badge');
+          if(badge){
+            badge.classList.remove('status-ok','status-fail');
+            badge.classList.add('status-pending');
+            badge.textContent = 'Checking…';
+          }
+        });
+      }
+
+      markPending();
+      loadStatus();
+      setInterval(loadStatus, 15000);
+    })();
   </script>
 </body>
 </html>
-

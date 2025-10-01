@@ -32,6 +32,7 @@ docker compose exec -T builder bash -lc '
 echo "[rebuild] Building linux/amd64 binary..."
 docker compose exec -T builder bash -lc '
   set -e;
+  git config --global --add safe.directory /app;
   export CGO_ENABLED=1 GOOS=linux GOARCH=amd64 GOFLAGS=-mod=mod;
   GO_BIN=${GO_BIN:-/usr/local/go/bin/go};
   "$GO_BIN" build -v -o bin/aidispatcher ./cmd/app;

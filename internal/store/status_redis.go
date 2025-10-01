@@ -75,3 +75,19 @@ func (s *RedisStatus) Get(ctx context.Context, jobID string) (Status, bool, erro
 
 func (s *RedisStatus) Close() error { return s.client.Close() }
 
+// SetFileJobMapping creates a mapping from file_id to job_id
+func (s *RedisStatus) SetFileJobMapping(ctx context.Context, fileID, jobID string) error {
+    key := fmt.Sprintf("file_to_job:%s", fileID)
+    // Set with 7 day expiration (job should complete before this)
+    return s.client.Set(ctx, key, jobID, 7*24*time.Hour).Err()
+}
+
+// GetJobByFileID retrieves the job_id associated with a file_id
+func (s *RedisStatus) GetJobByFileID(ctx context.Context, fileID string) (string, error) {
+    key := fmt.Sprintf("file_to_job:%s", fileID)
+    jobID, err := s.client.Get(ctx, key).Result()
+    if err == redis.Nil {
+        return "", fmt.Errorf("no job found for file_id: %s", fileID)
+    }
+    return jobID, err
+}

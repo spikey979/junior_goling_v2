@@ -12,8 +12,7 @@ import (
     "github.com/pdfcpu/pdfcpu/pkg/api"
     "github.com/rs/zerolog/log"
 
-    awscfg "github.com/aws/aws-sdk-go-v2/config"
-    "github.com/aws/aws-sdk-go-v2/service/s3"
+    "github.com/local/aidispatcher/internal/storage"
 )
 
 // DetermineTotalPages returns the number of pages for a PDF referenced by ref.
@@ -33,7 +32,7 @@ func DetermineTotalPages(ctx context.Context, ref string) (int, error) {
 
     switch {
     case strings.HasPrefix(ref, "s3://"):
-        localPath, err = downloadS3ToTemp(ctx, ref)
+        localPath, err = downloadS3ToTemp(ctx, ref, "") // TODO: pass password if needed
         tmpToRemove = localPath
     case strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://"):
         localPath, err = downloadHTTPToTemp(ctx, ref)
@@ -71,7 +70,7 @@ func downloadHTTPToTemp(ctx context.Context, url string) (string, error) {
     return f.Name(), nil
 }
 
-func downloadS3ToTemp(ctx context.Context, s3url string) (string, error) {
+func downloadS3ToTemp(ctx context.Context, s3url, password string) (string, error) {
     // s3://bucket/key
     path := strings.TrimPrefix(s3url, "s3://")
     slash := strings.Index(path, "/")
@@ -79,20 +78,54 @@ func downloadS3ToTemp(ctx context.Context, s3url string) (string, error) {
     bucket := path[:slash]
     key := path[slash+1:]
 
-    // Load AWS config (region from env or default chain)
-    cfg, err := awscfg.LoadDefaultConfig(ctx)
-    if err != nil { return "", err }
-    cli := s3.NewFromConfig(cfg)
+    // Create S3 client with decryption support
+    s3Client, err := storage.NewS3Client(ctx, bucket)
+    if err != nil { return "", fmt.Errorf("failed to create S3 client: %w", err) }
 
-    out, err := cli.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: &key})
-    if err != nil { return "", err }
-    defer out.Body.Close()
+    // Download and decrypt file
+    data, metadata, err := s3Client.DownloadFile(ctx, key, password)
+    if err != nil { return "", fmt.Errorf("failed to download from S3: %w", err) }
 
-    // Ensure .pdf extension for pdfcpu expectations
-    f, err := os.CreateTemp("", "s3pdf-*.pdf")
-    if err != nil { return "", err }
+    // Determine filename from metadata
+    filename := metadata.OriginalName
+    if filename == "" {
+        // Fallback: extract from S3 key
+        parts := strings.Split(key, "/")
+        if len(parts) > 0 {
+            filename = parts[len(parts)-1]
+            filename = strings.TrimSuffix(filename, "_original")
+        }
+    }
+
+    // Create temp file with determined filename
+    // Use pattern that preserves extension for proper file type detection
+    var f *os.File
+    if filename != "" && strings.Contains(filename, ".") {
+        // Has extension - use it to help with file type detection
+        ext := filepath.Ext(filename)
+        pattern := fmt.Sprintf("s3download-*%s", ext)
+        f, err = os.CreateTemp("", pattern)
+    } else {
+        // No extension - let file type detector rely on magic bytes only
+        f, err = os.CreateTemp("", "s3download-*")
+    }
+    if err != nil { return "", fmt.Errorf("failed to create temp file: %w", err) }
     defer f.Close()
-    if _, err := io.Copy(f, out.Body); err != nil { return "", err }
-    log.Info().Str("bucket", bucket).Str("key", key).Str("file", filepath.Base(f.Name())).Msg("downloaded s3 pdf to temp")
+
+    if _, err := f.Write(data); err != nil {
+        os.Remove(f.Name())
+        return "", fmt.Errorf("failed to write temp file: %w", err)
+    }
+
+    log.Info().
+        Str("bucket", bucket).
+        Str("key", key).
+        Str("original_name", filename).
+        Str("temp_file", filepath.Base(f.Name())).
+        Str("encryption_format", metadata.EncryptionFormat).
+        Int("size", len(data)).
+        Msg("downloaded and decrypted s3 file to temp")
+
     return f.Name(), nil
 }
+

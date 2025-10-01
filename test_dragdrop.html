@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Drag & Drop Test</title>
+<style>
+  body { font-family: sans-serif; padding: 20px; background: #f5f5f5; }
+  .upload-area {
+    border: 2px dashed #ccc;
+    border-radius: 8px;
+    padding: 40px;
+    text-align: center;
+    background: white;
+    max-width: 600px;
+    margin: 20px auto;
+    transition: all 0.3s;
+  }
+  .upload-area.dragover {
+    border-color: #3b82f6;
+    background: #e0f2ff;
+    transform: scale(1.02);
+  }
+  .file-info {
+    margin-top: 20px;
+    padding: 10px;
+    background: #f0f0f0;
+    border-radius: 4px;
+  }
+  .success { color: green; }
+  .error { color: red; }
+</style>
+</head>
+<body>
+  <h2>🧪 Test Drag & Drop</h2>
+
+  <div id="uploadArea" class="upload-area">
+    <h3>📤 Drag & Drop File Here</h3>
+    <p>or</p>
+    <input type="file" id="fileInput" accept=".pdf,.txt,.docx">
+    <div id="status">Ready for file...</div>
+  </div>
+
+  <div id="fileInfo" class="file-info" style="display:none;">
+    <h4>Selected File:</h4>
+    <div id="fileName"></div>
+    <div id="fileSize"></div>
+    <div id="fileType"></div>
+  </div>
+
+  <script>
+    const uploadArea = document.getElementById('uploadArea');
+    const fileInput = document.getElementById('fileInput');
+    const status = document.getElementById('status');
+    const fileInfo = document.getElementById('fileInfo');
+    const fileName = document.getElementById('fileName');
+    const fileSize = document.getElementById('fileSize');
+    const fileType = document.getElementById('fileType');
+
+    let selectedFile = null;
+
+    // Prevent default drag behaviors
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+      document.addEventListener(eventName, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      }, false);
+    });
+
+    // Highlight drop area when item is dragged over it
+    ['dragenter', 'dragover'].forEach(eventName => {
+      uploadArea.addEventListener(eventName, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        uploadArea.classList.add('dragover');
+        status.innerHTML = '<span class="success">Drop file here...</span>';
+      }, false);
+    });
+
+    ['dragleave', 'dragend'].forEach(eventName => {
+      uploadArea.addEventListener(eventName, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        uploadArea.classList.remove('dragover');
+        status.innerHTML = 'Ready for file...';
+      }, false);
+    });
+
+    // Handle dropped files
+    uploadArea.addEventListener('drop', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      uploadArea.classList.remove('dragover');
+
+      const files = e.dataTransfer.files;
+      console.log('Dropped files:', files);
+
+      if (files.length === 0) {
+        status.innerHTML = '<span class="error">No file detected!</span>';
+        return;
+      }
+
+      handleFile(files[0]);
+    }, false);
+
+    // Handle file selection via input
+    fileInput.addEventListener('change', (e) => {
+      if (fileInput.files.length > 0) {
+        handleFile(fileInput.files[0]);
+      }
+    });
+
+    function handleFile(file) {
+      selectedFile = file;
+
+      console.log('File selected:', file);
+
+      status.innerHTML = '<span class="success">✅ File selected!</span>';
+
+      fileName.textContent = 'Name: ' + file.name;
+      fileSize.textContent = 'Size: ' + Math.round(file.size / 1024) + ' KB';
+      fileType.textContent = 'Type: ' + (file.type || 'unknown');
+
+      fileInfo.style.display = 'block';
+
+      // Try to sync with file input
+      try {
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        fileInput.files = dt.files;
+        console.log('File input synced successfully');
+      } catch (err) {
+        console.log('Could not sync file input:', err);
+      }
+    }
+  </script>
+</body>
+</html>

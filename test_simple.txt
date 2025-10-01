@@ -1,0 +1,14 @@
+Test Document for MuPDF Extraction
+
+This is a simple test document.
+It contains multiple lines of text.
+
+Chapter 1: Introduction
+------------------------
+Lorem ipsum dolor sit amet, consectetur adipiscing elit.
+
+Chapter 2: Content
+------------------
+The quick brown fox jumps over the lazy dog.
+
+End of test document.
