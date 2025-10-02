@@ -133,15 +133,17 @@ func (o *Orchestrator) finalizeJobComplete(ctx context.Context, jobID string, to
 	} else {
 		filePath, _ := st.Metadata["file_path"].(string)
 		password, _ := st.Metadata["password"].(string)
-		s3URL, err := SaveAggregatedTextToS3(ctx, o.deps.Queue, filePath, jobID, aggregatedText, password)
+		// Upload as AI v2 (replaces old SaveAggregatedTextToS3)
+		s3URL, err := uploadAITextAsV2(ctx, o.deps.Queue, filePath, jobID, aggregatedText, password)
 		if err != nil {
-			log.Error().Err(err).Str("job_id", jobID).Msg("failed to save result to S3")
+			log.Error().Err(err).Str("job_id", jobID).Msg("failed to save AI v2 result to S3")
 			st.Status = "failed"
 			st.Message = fmt.Sprintf("Failed to save result: %v", err)
 			_ = o.deps.Status.Set(ctx, jobID, st)
 			return
 		}
 		st.Metadata["result_s3_url"] = s3URL
+		st.Metadata["text_v2_url"] = s3URL // Mark as v2
 	}
 
 	// Update status
@@ -252,8 +254,10 @@ func (o *Orchestrator) finalizeJobWithPartialResults(ctx context.Context, jobID 
 	} else {
 		filePath, _ := st.Metadata["file_path"].(string)
 		password, _ := st.Metadata["password"].(string)
-		s3URL, _ := SaveAggregatedTextToS3(ctx, o.deps.Queue, filePath, jobID, aggregatedText, password)
+		// Upload as AI v2 (timeout/partial results)
+		s3URL, _ := uploadAITextAsV2(ctx, o.deps.Queue, filePath, jobID, aggregatedText, password)
 		st.Metadata["result_s3_url"] = s3URL
+		st.Metadata["text_v2_url"] = s3URL // Mark as v2
 	}
 
 	// Update status

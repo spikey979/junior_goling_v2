@@ -16,6 +16,200 @@ type QueueChecker interface {
     IsCancelled(ctx context.Context, jobID string) (bool, error)
 }
 
+// uploadMuPDFTextAsV1 uploads aggregated MuPDF text as version 1 to S3
+// Returns: s3URL (with _v1 suffix), error
+func uploadMuPDFTextAsV1(ctx context.Context, queue QueueChecker, originalRef, jobID, text, password string) (string, error) {
+	// Check if job was cancelled before uploading
+	if queue != nil {
+		if cancelled, err := queue.IsCancelled(ctx, jobID); err == nil && cancelled {
+			log.Warn().Str("job_id", jobID).Msg("job is cancelled; aborting MuPDF v1 upload")
+			return "", fmt.Errorf("job %s was cancelled; MuPDF v1 upload aborted", jobID)
+		}
+	}
+
+	bucket := os.Getenv("AWS_S3_BUCKET")
+	if bucket == "" {
+		bucket = "junior-files-dev" // default bucket
+	}
+
+	// Extract bucket and original key from originalRef
+	var originalKey string
+	if strings.HasPrefix(originalRef, "s3://") {
+		path := strings.TrimPrefix(originalRef, "s3://")
+		parts := strings.SplitN(path, "/", 2)
+		if len(parts) == 2 && parts[0] != "" {
+			bucket = parts[0]
+			originalKey = parts[1]
+		}
+	}
+
+	// Generate v1 key by removing _original suffix and adding _v1
+	baseKey := strings.TrimSuffix(originalKey, "_original")
+	if baseKey == "" || baseKey == originalKey {
+		// Fallback if no _original suffix found
+		baseKey = fmt.Sprintf("results/%s/extracted_text", jobID)
+		log.Warn().Str("original_key", originalKey).Str("fallback_key", baseKey).Msg("original key missing _original suffix, using fallback")
+	}
+	v1Key := baseKey + "_v1"
+
+	// Create S3 client
+	s3Client, err := storage.NewS3Client(ctx, bucket)
+	if err != nil {
+		return "", fmt.Errorf("failed to create S3 client: %w", err)
+	}
+
+	// Download original file metadata to preserve Ghost Server fields
+	var originalMetadata *storage.FileMetadata
+	if originalKey != "" {
+		_, origMeta, err := s3Client.DownloadFile(ctx, originalKey, password)
+		if err != nil {
+			log.Warn().Err(err).Str("original_key", originalKey).Msg("failed to get original metadata for v1, using defaults")
+		} else {
+			originalMetadata = origMeta
+		}
+	}
+
+	// Prepare metadata for v1 upload (preserve original name)
+	originalName := "extracted_text_v1.txt"
+	if originalMetadata != nil && originalMetadata.OriginalName != "" {
+		originalName = originalMetadata.OriginalName
+	}
+
+	metadata := &storage.FileMetadata{
+		OriginalName: originalName,
+		ContentType:  "application/json", // Ghost Server expects application/json
+		Size:         int64(len(text)),
+		Metadata:     make(map[string]string),
+	}
+
+	// Copy ALL metadata from original file (Ghost Server compatibility)
+	if originalMetadata != nil && originalMetadata.Metadata != nil {
+		for k, v := range originalMetadata.Metadata {
+			metadata.Metadata[k] = v
+		}
+	}
+
+	// Override with v1-specific fields
+	metadata.Metadata["job_id"] = jobID
+	metadata.Metadata["version"] = "1"
+	metadata.Metadata["source"] = "mupdf_extraction"
+	metadata.Metadata["format"] = "plain_text"
+	metadata.Metadata["created"] = time.Now().UTC().Format(time.RFC3339)
+
+	// Upload to S3 as _v1
+	data := []byte(text)
+	if err := s3Client.UploadFile(ctx, v1Key, data, password, metadata); err != nil {
+		return "", fmt.Errorf("failed to upload MuPDF v1 to S3: %w", err)
+	}
+
+	s3URL := fmt.Sprintf("s3://%s/%s", bucket, v1Key)
+	log.Info().
+		Str("job_id", jobID).
+		Str("s3_url", s3URL).
+		Int("size", len(text)).
+		Msg("uploaded MuPDF text as version 1 to S3")
+
+	return s3URL, nil
+}
+
+// uploadAITextAsV2 uploads aggregated AI text as version 2 to S3 and promotes to base key
+// Returns: s3URL (base key, promoted as latest), error
+func uploadAITextAsV2(ctx context.Context, queue QueueChecker, originalRef, jobID, text, password string) (string, error) {
+	// Check if job was cancelled before uploading
+	if queue != nil {
+		if cancelled, err := queue.IsCancelled(ctx, jobID); err == nil && cancelled {
+			log.Warn().Str("job_id", jobID).Msg("job is cancelled; aborting AI v2 upload")
+			return "", fmt.Errorf("job %s was cancelled; AI v2 upload aborted", jobID)
+		}
+	}
+
+	bucket := os.Getenv("AWS_S3_BUCKET")
+	if bucket == "" {
+		bucket = "junior-files-dev" // default bucket
+	}
+
+	// Extract bucket and original key from originalRef
+	var originalKey string
+	if strings.HasPrefix(originalRef, "s3://") {
+		path := strings.TrimPrefix(originalRef, "s3://")
+		parts := strings.SplitN(path, "/", 2)
+		if len(parts) == 2 && parts[0] != "" {
+			bucket = parts[0]
+			originalKey = parts[1]
+		}
+	}
+
+	// Generate v2 key and base key
+	baseKey := strings.TrimSuffix(originalKey, "_original")
+	if baseKey == "" || baseKey == originalKey {
+		// Fallback if no _original suffix found
+		baseKey = fmt.Sprintf("results/%s/extracted_text", jobID)
+		log.Warn().Str("original_key", originalKey).Str("fallback_key", baseKey).Msg("original key missing _original suffix, using fallback")
+	}
+	v2Key := baseKey + "_v2"
+
+	// Create S3 client
+	s3Client, err := storage.NewS3Client(ctx, bucket)
+	if err != nil {
+		return "", fmt.Errorf("failed to create S3 client: %w", err)
+	}
+
+	// Prepare metadata for v2 upload
+	metadata := &storage.FileMetadata{
+		OriginalName: "extracted_text_v2.txt",
+		ContentType:  "application/json", // Ghost Server expects application/json
+		Size:         int64(len(text)),
+		Metadata: map[string]string{
+			"job_id":  jobID,
+			"version": "2",
+			"source":  "ai_extraction",
+			"format":  "plain_text",
+			"created": time.Now().UTC().Format(time.RFC3339),
+		},
+	}
+
+	// Upload to S3 as _v2
+	data := []byte(text)
+	if err := s3Client.UploadFile(ctx, v2Key, data, password, metadata); err != nil {
+		return "", fmt.Errorf("failed to upload AI v2 to S3: %w", err)
+	}
+
+	log.Info().
+		Str("job_id", jobID).
+		Str("v2_key", v2Key).
+		Int("size", len(text)).
+		Msg("uploaded AI text as version 2 to S3")
+
+	// Promote v2 to base key (latest version)
+	baseMeta := map[string]string{
+		"name":              "extracted_text.txt",
+		"content-type":      metadata.ContentType,
+		"encrypted":         "true",
+		"encryption-format": "3NCR0PTD",
+		"job_id":            jobID,
+		"version":           "2",
+		"source":            "ai_extraction",
+		"format":            "plain_text",
+		"created":           metadata.Metadata["created"],
+		"promoted_from":     v2Key,
+	}
+
+	if err := s3Client.CopyObjectWithMetadata(ctx, v2Key, baseKey, baseMeta); err != nil {
+		log.Warn().Err(err).Str("src", v2Key).Str("dst", baseKey).Msg("failed to promote v2 to base key")
+		// Return v2 URL even if promotion fails
+		return fmt.Sprintf("s3://%s/%s", bucket, v2Key), nil
+	}
+
+	log.Info().
+		Str("job_id", jobID).
+		Str("base_key", baseKey).
+		Msg("promoted AI v2 to base key as latest version")
+
+	// Return base key URL (promoted latest)
+	s3URL := fmt.Sprintf("s3://%s/%s", bucket, baseKey)
+	return s3URL, nil
+}
+
 // SaveAggregatedTextToS3 uploads the aggregated text to S3 (encrypted) and returns the s3:// URL.
 // It derives the output location as: results/{jobID}/extracted_text.txt in the same bucket.
 // NOTE: File is encrypted using the same password used to download the original file.

@@ -13,6 +13,7 @@ import (
 	"github.com/local/aidispatcher/internal/converter"
 	"github.com/local/aidispatcher/internal/imagerender"
 	"github.com/local/aidispatcher/internal/mupdf"
+	"github.com/local/aidispatcher/internal/pdftest"
 	"github.com/rs/zerolog/log"
 )
 
@@ -34,7 +35,17 @@ type AIPagePayload struct {
 	HeightPx       int    // Image height in pixels
 	ContextText    string // Text from surrounding pages (limited by MaxContextBytes)
 	MuPDFText      string // Extracted MuPDF text
-	Classification string // "TEXT_ONLY" or "HAS_GRAPHICS"
+	Classification string // "TEXT_ONLY" or "HAS_GRAPHICS" (deprecated, no longer used)
+}
+
+// AIPayloadOptions contains configuration for AI payload preparation
+type AIPayloadOptions struct {
+	DPI             int
+	JPEGQuality     int
+	Color           string
+	IncludeBase64   bool
+	ContextRadius   int  // Number of pages before/after to include as context
+	MaxContextBytes int  // Maximum bytes for context text
 }
 
 // ProcessJobForAI handles complete AI pipeline: download, convert, classify, extract, prepare
@@ -58,12 +69,12 @@ func (o *Orchestrator) ProcessJobForAI(ctx context.Context, jobID, filePath, use
 	})
 
 	// Step 1: Download file from S3 (if needed) - 10%
-	pdfPath, cleanup, err := o.downloadAndPrepareFile(ctx, filePath, password, jobID)
-	if cleanup != nil {
-		defer cleanup() // Ensure cleanup happens
-	}
+	prepResult, err := o.downloadAndPrepareFile(ctx, filePath, password, jobID)
 	if err != nil {
 		return fmt.Errorf("failed to download/prepare file: %w", err)
+	}
+	if prepResult.Cleanup != nil {
+		defer prepResult.Cleanup() // Ensure cleanup happens
 	}
 
 	_ = o.deps.Status.Set(ctx, jobID, Status{
@@ -72,16 +83,19 @@ func (o *Orchestrator) ProcessJobForAI(ctx context.Context, jobID, filePath, use
 		Message:  "File downloaded and prepared",
 		Start:    &startTime,
 		Metadata: map[string]any{
-			"file_path":  filePath,
-			"user":       user,
-			"password":   password,
-			"source":     "api",
-			"local_path": pdfPath,
+			"file_path":       filePath,
+			"user":            user,
+			"password":        password,
+			"source":          "api",
+			"local_path":      prepResult.PDFPath,
+			"mime_type":       prepResult.MIMEType,
+			"mupdf_readable":  prepResult.MuPDFReadable,
+			"processing_mode": map[bool]string{true: "mupdf_ai", false: "pure_ai"}[prepResult.MuPDFReadable],
 		},
 	})
 
 	// Step 2: MuPDF page-by-page text extraction - 20-25%
-	pageTexts, err := o.extractPageTexts(ctx, pdfPath, jobID)
+	pageTexts, err := o.extractPageTexts(ctx, prepResult.PDFPath, jobID)
 	if err != nil {
 		return fmt.Errorf("failed to extract page texts: %w", err)
 	}
@@ -104,94 +118,86 @@ func (o *Orchestrator) ProcessJobForAI(ctx context.Context, jobID, filePath, use
 		Int("pages", len(pageTexts)).
 		Msg("pre-stored MuPDF text for all pages in Redis")
 
-	_ = o.deps.Status.Set(ctx, jobID, Status{
-		Status:   "processing",
-		Progress: 25,
-		Message:  fmt.Sprintf("Extracted text from %d pages", len(pageTexts)),
-		Start:    &startTime,
-		Metadata: map[string]any{
-			"file_path":  filePath,
-			"user":       user,
-			"password":   password,
-			"source":     "api",
-			"local_path": pdfPath,
-			"page_count": len(pageTexts),
-		},
-	})
-
-	// Step 3: Page classification - 30-40%
-	classifications, err := o.classifyPages(ctx, pdfPath, pageTexts, jobID)
-	if err != nil {
-		return fmt.Errorf("failed to classify pages: %w", err)
+	// Step 2.5: Upload MuPDF text as version 1 to S3 (only if readable) - 30-35%
+	var textV1URL string
+	if prepResult.MuPDFReadable {
+		aggregatedText := aggregateMuPDFText(pageTexts, len(pageTexts))
+		v1URL, err := uploadMuPDFTextAsV1(ctx, o.deps.Queue, filePath, jobID, aggregatedText, password)
+		if err != nil {
+			log.Error().Err(err).Str("job_id", jobID).Msg("failed to upload MuPDF v1, continuing with AI pipeline")
+		} else {
+			textV1URL = v1URL
+			log.Info().Str("job_id", jobID).Str("v1_url", v1URL).Msg("MuPDF v1 uploaded successfully")
+		}
+	} else {
+		log.Info().Str("job_id", jobID).Msg("skipping MuPDF v1 upload (PDF not readable by MuPDF)")
 	}
 
 	_ = o.deps.Status.Set(ctx, jobID, Status{
 		Status:   "processing",
-		Progress: 40,
-		Message:  "Page classification completed",
+		Progress: 35,
+		Message:  "MuPDF extraction completed",
 		Start:    &startTime,
 		Metadata: map[string]any{
-			"file_path":         filePath,
-			"user":              user,
-			"password":          password,
-			"source":            "api",
-			"local_path":        pdfPath,
-			"page_count":        len(classifications),
-			"text_only_pages":   countByClassification(classifications, "TEXT_ONLY"),
-			"graphics_pages":    countByClassification(classifications, "HAS_GRAPHICS"),
+			"file_path":      filePath,
+			"user":           user,
+			"password":       password,
+			"source":         "api",
+			"local_path":     prepResult.PDFPath,
+			"page_count":     len(pageTexts),
+			"text_v1_url":    textV1URL,
+			"mupdf_readable": prepResult.MuPDFReadable,
 		},
 	})
 
-	// Step 4: Image rendering and payload preparation - 40-50%
-	payloads, err := o.prepareAIPayloads(ctx, pdfPath, classifications, pageTexts, jobID)
+	// Step 3: Image rendering and payload preparation for ALL pages - 40-50%
+	// NOTE: We no longer classify pages - ALL pages go to AI with rendered images
+	totalPages := len(pageTexts)
+	payloads, err := o.prepareAIPayloadsForAllPages(ctx, prepResult.PDFPath, pageTexts, jobID)
 	if err != nil {
 		return fmt.Errorf("failed to prepare AI payloads: %w", err)
 	}
 
 	_ = o.deps.Status.Set(ctx, jobID, Status{
 		Status:   "processing",
-		Progress: 50,
-		Message:  "AI payloads prepared",
+		Progress: 55,
+		Message:  "AI payloads prepared for all pages",
 		Start:    &startTime,
 		Metadata: map[string]any{
 			"file_path":         filePath,
 			"user":              user,
 			"password":          password,
 			"source":            "api",
-			"local_path":        pdfPath,
-			"page_count":        len(classifications),
-			"text_only_pages":   countByClassification(classifications, "TEXT_ONLY"),
-			"graphics_pages":    countByClassification(classifications, "HAS_GRAPHICS"),
+			"local_path":        prepResult.PDFPath,
+			"page_count":        totalPages,
 			"payloads_prepared": len(payloads),
+			"text_v1_url":       textV1URL,
 		},
 	})
 
-	// Step 5: Enqueue AI payloads to Redis queue
-	totalPages := len(classifications)
+	// Step 4: Enqueue AI payloads to Redis queue (ALL pages now)
 	aiPages := len(payloads)
-	textOnlyPages := countByClassification(classifications, "TEXT_ONLY")
 
 	// Enqueue all AI pages with proper worker payload format
 	for _, aiPayload := range payloads {
 		// Create worker-compatible payload
 		workerPayload := map[string]interface{}{
-			"job_id":           jobID,
-			"page_id":          aiPayload.PageNum,
-			"content_ref":      "", // Empty for in-memory processing
-			"ai_engine":        "openai", // Default, can be overridden
-			"force_fast":       false,
-			"attempt":          1,
-			"image_b64":        aiPayload.ImageBase64,
-			"image_mime":       aiPayload.ImageMIME,
-			"width_px":         aiPayload.WidthPx,
-			"height_px":        aiPayload.HeightPx,
-			"mupdf_text":       aiPayload.MuPDFText,
-			"context_text":     aiPayload.ContextText,
-			"system_prompt":    o.cfg.SystemPrompt.DefaultPrompt,
-			"classification":   aiPayload.Classification,
-			"idempotency_key":  fmt.Sprintf("%s:page:%d", jobID, aiPayload.PageNum),
-			"user":             user,
-			"source":           "api",
+			"job_id":          jobID,
+			"page_id":         aiPayload.PageNum,
+			"content_ref":     "", // Empty for in-memory processing
+			"ai_engine":       "openai", // Default, can be overridden
+			"force_fast":      false,
+			"attempt":         1,
+			"image_b64":       aiPayload.ImageBase64,
+			"image_mime":      aiPayload.ImageMIME,
+			"width_px":        aiPayload.WidthPx,
+			"height_px":       aiPayload.HeightPx,
+			"mupdf_text":      aiPayload.MuPDFText,
+			"context_text":    aiPayload.ContextText,
+			"system_prompt":   o.cfg.SystemPrompt.DefaultPrompt,
+			"idempotency_key": fmt.Sprintf("%s:page:%d", jobID, aiPayload.PageNum),
+			"user":            user,
+			"source":          "api",
 		}
 
 		payloadJSON, err := json.Marshal(workerPayload)
@@ -209,26 +215,26 @@ func (o *Orchestrator) ProcessJobForAI(ctx context.Context, jobID, filePath, use
 	log.Info().
 		Str("job_id", jobID).
 		Int("ai_pages", aiPages).
-		Int("text_only_pages", textOnlyPages).
-		Msg("AI pages enqueued to Redis queue")
+		Int("total_pages", totalPages).
+		Msg("all pages enqueued to Redis queue for AI processing")
 
 	// Update status with AI page tracking
 	_ = o.deps.Status.Set(ctx, jobID, Status{
 		Status:   "processing",
-		Progress: 60,
-		Message:  fmt.Sprintf("Enqueued %d AI pages for processing", aiPages),
+		Progress: 65,
+		Message:  fmt.Sprintf("Enqueued %d pages for AI processing", aiPages),
 		Start:    &startTime,
 		Metadata: map[string]any{
-			"file_path":       filePath,
-			"user":            user,
-			"password":        password,
-			"source":          "api",
-			"local_path":      pdfPath,
-			"total_pages":     totalPages,
-			"ai_pages":        aiPages,
-			"text_only_pages": textOnlyPages,
-			"pages_done":      0,
-			"pages_failed":    0,
+			"file_path":   filePath,
+			"user":        user,
+			"password":    password,
+			"source":      "api",
+			"local_path":  prepResult.PDFPath,
+			"total_pages": totalPages,
+			"ai_pages":    aiPages,
+			"text_v1_url": textV1URL,
+			"pages_done":  0,
+			"pages_failed": 0,
 		},
 	})
 
@@ -249,9 +255,18 @@ func (o *Orchestrator) ProcessJobForAI(ctx context.Context, jobID, filePath, use
 	return nil
 }
 
-// downloadAndPrepareFile downloads from S3, detects file type, converts to PDF if needed
-// Returns: pdfPath, cleanup function, error
-func (o *Orchestrator) downloadAndPrepareFile(ctx context.Context, filePath, password, jobID string) (string, func(), error) {
+// FilePreparationResult contains all info about prepared file
+type FilePreparationResult struct {
+	PDFPath       string
+	MIMEType      string
+	Extension     string
+	MuPDFReadable bool
+	Cleanup       func()
+}
+
+// downloadAndPrepareFile downloads from S3, detects file type, converts to PDF if needed, checks MuPDF readability
+// Returns: FilePreparationResult, error
+func (o *Orchestrator) downloadAndPrepareFile(ctx context.Context, filePath, password, jobID string) (*FilePreparationResult, error) {
 	var cleanupFuncs []func()
 	cleanup := func() {
 		for _, fn := range cleanupFuncs {
@@ -261,12 +276,12 @@ func (o *Orchestrator) downloadAndPrepareFile(ctx context.Context, filePath, pas
 
 	// Download from S3 with decryption
 	if !strings.HasPrefix(filePath, "s3://") {
-		return "", cleanup, fmt.Errorf("only S3 paths supported for now: %s", filePath)
+		return nil, fmt.Errorf("only S3 paths supported for now: %s", filePath)
 	}
 
 	tempFile, err := downloadS3ToTemp(ctx, filePath, password)
 	if err != nil {
-		return "", cleanup, fmt.Errorf("failed to download from S3: %w", err)
+		return nil, fmt.Errorf("failed to download from S3: %w", err)
 	}
 	cleanupFuncs = append(cleanupFuncs, func() { os.Remove(tempFile) })
 
@@ -275,11 +290,11 @@ func (o *Orchestrator) downloadAndPrepareFile(ctx context.Context, filePath, pas
 	// Detect file type
 	fileInfo, err := o.deps.FileType.Detect(tempFile)
 	if err != nil {
-		return "", cleanup, fmt.Errorf("file type detection failed: %w", err)
+		return nil, fmt.Errorf("file type detection failed: %w", err)
 	}
 
 	if !fileInfo.Supported {
-		return "", cleanup, fmt.Errorf("unsupported file type: %s", fileInfo.Description)
+		return nil, fmt.Errorf("unsupported file type: %s", fileInfo.Description)
 	}
 
 	log.Info().Str("job_id", jobID).Str("mime", fileInfo.MIMEType).Str("desc", fileInfo.Description).Msg("detected file type")
@@ -299,7 +314,7 @@ func (o *Orchestrator) downloadAndPrepareFile(ctx context.Context, filePath, pas
 
 		result := o.deps.Converter.ConvertToPDF(convJob)
 		if !result.Success {
-			return "", cleanup, fmt.Errorf("conversion failed: %s", result.Error)
+			return nil, fmt.Errorf("conversion failed: %s", result.Error)
 		}
 
 		pdfPath = result.OutputPath
@@ -308,7 +323,48 @@ func (o *Orchestrator) downloadAndPrepareFile(ctx context.Context, filePath, pas
 		log.Info().Str("job_id", jobID).Str("pdf", pdfPath).Dur("duration", result.Duration).Msg("conversion successful")
 	}
 
-	return pdfPath, cleanup, nil
+	// Check MuPDF readability
+	hasText, diag, err := pdftest.HasExtractableText(pdfPath, 300)
+	if err != nil {
+		log.Warn().Err(err).Str("job_id", jobID).Msg("MuPDF readability check failed, assuming readable")
+		hasText = true // Default to readable on check failure
+	}
+
+	log.Info().
+		Str("job_id", jobID).
+		Bool("mupdf_readable", hasText).
+		Int("chars_sampled", diag.TotalCharsInSample).
+		Int("threshold", diag.Threshold).
+		Msg("MuPDF readability check completed")
+
+	return &FilePreparationResult{
+		PDFPath:       pdfPath,
+		MIMEType:      fileInfo.MIMEType,
+		Extension:     fileInfo.Extension,
+		MuPDFReadable: hasText,
+		Cleanup:       cleanup,
+	}, nil
+}
+
+// aggregateMuPDFText combines all page texts into a single document string
+// Format: "=== Page 1 ===\n{text}\n\n=== Page 2 ===\n{text}..."
+func aggregateMuPDFText(pageTexts map[int]string, totalPages int) string {
+	var builder strings.Builder
+
+	for i := 1; i <= totalPages; i++ {
+		if i > 1 {
+			builder.WriteString("\n\n")
+		}
+		builder.WriteString(fmt.Sprintf("=== Page %d ===\n", i))
+
+		if text, exists := pageTexts[i]; exists && text != "" {
+			builder.WriteString(text)
+		} else {
+			builder.WriteString("[No text extracted]")
+		}
+	}
+
+	return builder.String()
 }
 
 // extractPageTexts extracts text from each page using MuPDF/go-fitz
@@ -486,6 +542,85 @@ func (o *Orchestrator) prepareAIPayloads(ctx context.Context, pdfPath string, cl
 		Int("payloads", len(payloads)).
 		Int64("total_image_bytes", totalImageBytes).
 		Msg("AI payload preparation completed (in-memory)")
+
+	return payloads, nil
+}
+
+// prepareAIPayloadsForAllPages renders images and prepares payloads for ALL pages (no classification)
+func (o *Orchestrator) prepareAIPayloadsForAllPages(ctx context.Context, pdfPath string, pageTexts map[int]string, jobID string) ([]AIPagePayload, error) {
+	var payloads []AIPagePayload
+	var totalImageBytes int64
+
+	// Rendering options (same as before)
+	opts := AIPayloadOptions{
+		DPI:            100,
+		JPEGQuality:    70,
+		Color:          "rgb",
+		IncludeBase64:  true,
+		ContextRadius:  1, // ±1 page context
+		MaxContextBytes: 4000,
+	}
+
+	totalPages := len(pageTexts)
+
+	for pageNum := 1; pageNum <= totalPages; pageNum++ {
+		// Render image for EVERY page
+		jpegBytes, width, height, err := imagerender.RenderPageToJPEG(
+			pdfPath,
+			pageNum,
+			opts.DPI,
+			opts.JPEGQuality,
+			opts.Color,
+		)
+		if err != nil {
+			log.Error().Err(err).Int("page", pageNum).Msg("failed to render page to JPEG - skipping page")
+			continue
+		}
+
+		totalImageBytes += int64(len(jpegBytes))
+		imageBase64 := imagerender.EncodeToBase64(jpegBytes)
+
+		log.Debug().
+			Str("job_id", jobID).
+			Int("page", pageNum).
+			Int("jpeg_size", len(jpegBytes)).
+			Int("width", width).
+			Int("height", height).
+			Msg("rendered page to JPEG (in-memory)")
+
+		// Prepare context text with ±1 radius
+		contextText := prepareContextTextWithLimit(pageTexts, pageNum, opts.ContextRadius, opts.MaxContextBytes)
+
+		// Get MuPDF text for this page
+		mupdfText, _ := pageTexts[pageNum]
+
+		payload := AIPagePayload{
+			PageNum:     pageNum,
+			ImageBytes:  jpegBytes,
+			ImageBase64: imageBase64,
+			ImageMIME:   "image/jpeg",
+			WidthPx:     width,
+			HeightPx:    height,
+			ContextText: contextText,
+			MuPDFText:   mupdfText,
+			// Classification removed - not needed anymore
+		}
+
+		payloads = append(payloads, payload)
+
+		log.Debug().
+			Str("job_id", jobID).
+			Int("page", pageNum).
+			Int("context_chars", len(contextText)).
+			Int("mupdf_chars", len(mupdfText)).
+			Msg("prepared AI payload")
+	}
+
+	log.Info().
+		Str("job_id", jobID).
+		Int("payloads", len(payloads)).
+		Int64("total_image_bytes", totalImageBytes).
+		Msg("AI payload preparation completed (in-memory) - all pages")
 
 	return payloads, nil
 }
