@@ -78,14 +78,27 @@ type ImageOptions struct {
     IncludeBase64   bool   // convert to base64 for JSON transport
 }
 
+// TimeoutConfig holds timeout settings for requests and jobs
+type TimeoutConfig struct {
+    RequestTimeout time.Duration // Max time per AI API call (default: 120s)
+    JobTimeout     time.Duration // Max time for entire document (default: 5m)
+}
+
+// SystemPromptConfig holds AI prompt configuration
+type SystemPromptConfig struct {
+    DefaultPrompt string
+}
+
 // Config is the top-level configuration.
 type Config struct {
-    Logging   LoggingConfig
-    Axiom     AxiomConfig
-    Providers ProvidersConfig
-    Worker    WorkerConfig
-    Queue     QueueConfig
-    Image     ImageOptions
+    Logging      LoggingConfig
+    Axiom        AxiomConfig
+    Providers    ProvidersConfig
+    Worker       WorkerConfig
+    Queue        QueueConfig
+    Image        ImageOptions
+    Timeouts     TimeoutConfig
+    SystemPrompt SystemPromptConfig
 }
 
 // FromEnv loads configuration from environment with sensible defaults.
@@ -158,6 +171,27 @@ func FromEnv() Config {
     // Image defaults
     cfg.Image = DefaultImageOptions()
 
+    // Timeout configuration with backwards compatibility
+    requestTimeout := getEnv("REQUEST_TIMEOUT", "")
+    if requestTimeout == "" {
+        requestTimeout = getEnv("PAGE_TOTAL_TIMEOUT", "120s")
+    }
+
+    jobTimeout := getEnv("JOB_TIMEOUT", "")
+    if jobTimeout == "" {
+        jobTimeout = getEnv("DOCUMENT_PROCESSING_TIMEOUT", "5m")
+    }
+
+    cfg.Timeouts = TimeoutConfig{
+        RequestTimeout: parseDuration(requestTimeout, 120*time.Second),
+        JobTimeout:     parseDuration(jobTimeout, 5*time.Minute),
+    }
+
+    // System prompt configuration
+    cfg.SystemPrompt = SystemPromptConfig{
+        DefaultPrompt: getEnv("AI_SYSTEM_PROMPT", DefaultSystemPrompt()),
+    }
+
     return cfg
 }
 
@@ -210,4 +244,25 @@ func devDefaultPretty() string {
     env := strings.ToLower(os.Getenv("ENVIRONMENT"))
     if env == "dev" || env == "development" || env == "local" { return "true" }
     return "false"
+}
+
+// DefaultSystemPrompt returns the default AI system prompt
+func DefaultSystemPrompt() string {
+    return `You are an expert document analysis AI with advanced OCR and vision capabilities. Your task is to:
+
+RULES:
+- PRIMARY: Extract ALL visible text from the CURRENT PAGE image with maximum accuracy
+- Preserve reading order, structure, and layout (multi-column, tables, lists, headers, formulas, symbols)
+- Maintain original wording EXACTLY (do not paraphrase or comment)
+- Rewrite the extracted text in a **single-column flow**, ignoring any original multi-column or block layout.
+- Include figure/image/diagram descriptions in reading order using this format:
+  [Figure/Image/Table Name or Number]
+  [Objective technical description]
+- Use CONTEXT (text from surrounding pages) ONLY as supporting reference to better describe non-text elements (figures, charts, diagrams, tables) or resolve unclear symbols — never to change or override actual text from the current page
+- Exclude page headers/footers, watermarks, or irrelevant artifacts
+- Do NOT add introductions, explanations, or meta-commentary
+- Output must start immediately with the first line of document text
+
+GOAL:
+Return the document content in a structured, accurate, and comprehensive way that preserves the original meaning and organization, while using CONTEXT to enhance understanding of graphical or ambiguous content.`
 }

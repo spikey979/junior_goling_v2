@@ -41,25 +41,54 @@ type StatusStore interface {
     GetJobByFileID(ctx context.Context, fileID string) (string, error)
 }
 
+type RedisClient interface {
+    Set(ctx context.Context, key string, value interface{}, expiration time.Duration) StatusCmd
+    Get(ctx context.Context, key string) StringCmd
+}
+
+type StatusCmd interface {
+    Err() error
+}
+
+type StringCmd interface {
+    Result() (string, error)
+}
+
 type Dependencies struct {
     Queue     Queue
     Status    StatusStore
     Pages     PageStore
     Converter *converter.LibreOffice
     FileType  *filetype.Detector
+    Redis     RedisClient
 }
 
 type Orchestrator struct {
     deps Dependencies
+    cfg  Config
 }
 
-func New(deps Dependencies) *Orchestrator {
-    return &Orchestrator{deps: deps}
+type Config struct {
+    Timeouts     TimeoutConfig
+    SystemPrompt SystemPromptConfig
+}
+
+type TimeoutConfig struct {
+    JobTimeout time.Duration
+}
+
+type SystemPromptConfig struct {
+    DefaultPrompt string
+}
+
+func New(deps Dependencies, cfg Config) *Orchestrator {
+    return &Orchestrator{deps: deps, cfg: cfg}
 }
 
 type PageStore interface {
     SavePageText(ctx context.Context, jobID string, page int, text, source, provider, model string) error
     GetPageText(ctx context.Context, jobID string, page int) (string, error)
+    GetPageTextWithSource(ctx context.Context, jobID string, page int) (string, string, error)
     AggregateText(ctx context.Context, jobID string, total int) (string, error)
 }
 
@@ -348,14 +377,14 @@ func (o *Orchestrator) handleProcessUpload(w http.ResponseWriter, r *http.Reques
 
     // Start document-level timeout monitor in background
     // Default timeout 3m unless overridden via DOCUMENT_PROCESSING_TIMEOUT
-    go func(jid string, total int){
+    go func(jid string, total, aiPagesCount int){
         to := os.Getenv("DOCUMENT_PROCESSING_TIMEOUT")
         dur, err := time.ParseDuration(to)
         if err != nil || dur <= 0 { dur = 3 * time.Minute }
         ctx, cancel := context.WithTimeout(context.Background(), dur)
         defer cancel()
-        o.monitorJobCompletion(ctx, jid, total)
-    }(jobID, pages)
+        o.monitorJobCompletion(ctx, jid, total, aiPagesCount)
+    }(jobID, pages, len(sel.AIPages))
 
     w.Header().Set("Content-Type", "application/json")
     w.WriteHeader(http.StatusCreated)
@@ -473,6 +502,18 @@ func (o *Orchestrator) handlePageDone(w http.ResponseWriter, r *http.Request) {
         agg, _ := o.deps.Pages.AggregateText(r.Context(), jobID, total)
         if st.Metadata == nil { st.Metadata = map[string]any{} }
         st.Metadata["result_text_len"] = len(agg)
+
+        // DEBUG: Log aggregated text preview
+        preview := agg
+        if len(agg) > 300 {
+            preview = agg[:300] + "..."
+        }
+        log.Debug().
+            Str("job_id", jobID).
+            Int("agg_length", len(agg)).
+            Str("agg_preview", preview).
+            Msg("handlePageDone aggregated text")
+
         // Save result depending on source
         if src, _ := st.Metadata["source"].(string); src == "upload" {
             if localPath, err := SaveAggregatedTextToLocal(r.Context(), jobID, agg); err == nil {
@@ -550,17 +591,6 @@ func (o *Orchestrator) handlePageFailed(w http.ResponseWriter, r *http.Request) 
     w.WriteHeader(http.StatusNoContent)
 }
 
-func intFromMeta(m map[string]any, key string) int {
-    if m == nil { return 0 }
-    if v, ok := m[key]; ok {
-        switch t := v.(type) {
-        case float64: return int(t)
-        case int: return t
-        }
-    }
-    return 0
-}
-
 type cancelReq struct {
     JobID  string `json:"job_id"`
     Reason string `json:"reason,omitempty"`
@@ -583,103 +613,6 @@ func (o *Orchestrator) handleCancelJob(w http.ResponseWriter, r *http.Request) {
     now := time.Now(); st.End = &now
     _ = o.deps.Status.Set(r.Context(), req.JobID, st)
     _ = json.NewEncoder(w).Encode(map[string]any{"success": true, "job_id": req.JobID, "status": "cancelled"})
-}
-
-// monitorJobCompletion enforces a document-level SLA. It finalizes the job with
-// partial results on timeout by applying MuPDF fallback for missing pages, and cancels the job in the queue.
-func (o *Orchestrator) monitorJobCompletion(ctx context.Context, jobID string, totalPages int) {
-    ticker := time.NewTicker(1 * time.Second)
-    defer ticker.Stop()
-    for {
-        select {
-        case <-ctx.Done():
-            // Timeout reached: finalize with partial results and cancel further processing
-            st, ok, _ := o.deps.Status.Get(context.Background(), jobID)
-            if !ok { return }
-            // Apply MuPDF fallback for pages without text
-            for i := 1; i <= totalPages; i++ {
-                t, _ := o.deps.Pages.GetPageText(context.Background(), jobID, i)
-                if t == "" {
-                    // Determine file reference
-                    var fileRef string
-                    if st.Metadata != nil {
-                        if v, _ := st.Metadata["file_local"].(string); v != "" { fileRef = v }
-                        if fileRef == "" { if v, _ := st.Metadata["file_path"].(string); v != "" { fileRef = v } }
-                    }
-                    if txt := o.getMuPDFTextForPage(context.Background(), fileRef, i); txt != "" {
-                        _ = o.deps.Pages.SavePageText(context.Background(), jobID, i, txt, "mupdf_timeout_fallback", "", "")
-                    }
-                }
-            }
-            // Cancel job to stop workers processing further
-            _ = o.deps.Queue.CancelJob(context.Background(), jobID)
-            // Finalize status
-            o.finalizeJobWithPartialResults(context.Background(), jobID, totalPages)
-            return
-        case <-ticker.C:
-            st, ok, _ := o.deps.Status.Get(context.Background(), jobID)
-            if !ok { continue }
-            if st.Status == "success" { return }
-            done := intFromMeta(st.Metadata, "pages_done")
-            failed := intFromMeta(st.Metadata, "pages_failed")
-            if done+failed >= totalPages {
-                // Normal completion: ensure aggregation done; if already handled by handlers, this no-ops
-                o.finalizeJobComplete(context.Background(), jobID, totalPages)
-                return
-            }
-        }
-    }
-}
-
-// finalizeJobComplete aggregates and stores the result when all pages are done/failed.
-func (o *Orchestrator) finalizeJobComplete(ctx context.Context, jobID string, totalPages int) {
-    st, ok, err := o.deps.Status.Get(ctx, jobID)
-    if err != nil || !ok { return }
-    if st.Status == "success" { return }
-    agg, _ := o.deps.Pages.AggregateText(ctx, jobID, totalPages)
-    if st.Metadata == nil { st.Metadata = map[string]any{} }
-    st.Metadata["result_text_len"] = len(agg)
-    // Save result depending on source
-    if src, _ := st.Metadata["source"].(string); src == "upload" {
-        if localPath, err := SaveAggregatedTextToLocal(ctx, jobID, agg); err == nil {
-            st.Metadata["result_local_path"] = localPath
-        }
-    } else {
-        filePath, _ := st.Metadata["file_path"].(string)
-        password, _ := st.Metadata["password"].(string)
-        if s3url, err := SaveAggregatedTextToS3(ctx, filePath, jobID, agg, password); err == nil {
-            st.Metadata["result_s3_url"] = s3url
-        }
-    }
-    st.Status = "success"
-    st.Progress = 100
-    _ = o.deps.Status.Set(ctx, jobID, st)
-}
-
-// finalizeJobWithPartialResults finalizes with timeout metadata and aggregated result.
-func (o *Orchestrator) finalizeJobWithPartialResults(ctx context.Context, jobID string, totalPages int) {
-    st, ok, err := o.deps.Status.Get(ctx, jobID)
-    if err != nil || !ok { return }
-    done := intFromMeta(st.Metadata, "pages_done")
-    failed := intFromMeta(st.Metadata, "pages_failed")
-    missing := totalPages - (done + failed)
-    o.finalizeJobComplete(ctx, jobID, totalPages)
-    // Re-read to update metadata
-    st2, ok2, _ := o.deps.Status.Get(ctx, jobID)
-    if ok2 {
-        if st2.Metadata == nil { st2.Metadata = map[string]any{} }
-        st2.Metadata["timeout_occurred"] = true
-        st2.Metadata["missing_pages"] = missing
-        _ = o.deps.Status.Set(ctx, jobID, st2)
-    }
-}
-
-// getMuPDFTextForPage extracts text using MuPDF from a file reference.
-func (o *Orchestrator) getMuPDFTextForPage(ctx context.Context, fileRef string, page int) string {
-    if fileRef == "" { return "" }
-    txt, err := ExtractPageText(ctx, fileRef, page)
-    if err != nil { return "" }
-    return txt
 }
 
 // processMuPDFOnly handles text-only extraction using MuPDF without AI

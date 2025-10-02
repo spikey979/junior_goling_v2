@@ -84,13 +84,24 @@ func main() {
     // File type detector
     fileTypeDetector := filetype.New()
 
-    orch := orchestrator.New(orchestrator.Dependencies{
-        Queue:     rq,
-        Status:    orchestrator.NewStatusAdapter(rs),
-        Pages:     ps,
-        Converter: conv,
-        FileType:  fileTypeDetector,
-    })
+    orch := orchestrator.New(
+        orchestrator.Dependencies{
+            Queue:     rq,
+            Status:    orchestrator.NewStatusAdapter(rs),
+            Pages:     ps,
+            Converter: conv,
+            FileType:  fileTypeDetector,
+            Redis:     orchestrator.NewRedisAdapter(rs.Client()), // Add Redis client for MuPDF pre-storage
+        },
+        orchestrator.Config{
+            Timeouts: orchestrator.TimeoutConfig{
+                JobTimeout: cfg.Timeouts.JobTimeout,
+            },
+            SystemPrompt: orchestrator.SystemPromptConfig{
+                DefaultPrompt: cfg.SystemPrompt.DefaultPrompt,
+            },
+        },
+    )
     mux := http.NewServeMux()
     orch.RegisterRoutes(mux)
     // Deep health route

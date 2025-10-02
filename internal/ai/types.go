@@ -8,12 +8,18 @@ import (
 
 // Request represents a generic AI inference request for a page.
 type Request struct {
-    JobID      string
-    PageID     int
-    ContentRef string
-    Model      string
-    Params     map[string]any
-    Timeout    time.Duration
+    JobID         string
+    PageID        int
+    ContentRef    string
+    Model         string
+    Params        map[string]any
+    Timeout       time.Duration
+    // Vision fields
+    ImageBase64   string // Base64 encoded image
+    ImageMIME     string // Image MIME type (image/jpeg)
+    SystemPrompt  string // System prompt for AI
+    ContextText   string // Context from surrounding pages
+    MuPDFText     string // Extracted MuPDF text
 }
 
 type Response struct {

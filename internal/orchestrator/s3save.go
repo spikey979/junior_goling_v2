@@ -88,6 +88,18 @@ func SaveAggregatedTextToS3(ctx context.Context, originalRef, jobID, text, passw
 
     // Upload encrypted file to S3
     data := []byte(text)
+
+    // DEBUG: Log what we're about to save
+    log.Debug().
+        Str("job_id", jobID).
+        Str("key", key).
+        Int("text_length", len(text)).
+        Int("data_length", len(data)).
+        Bool("has_password", password != "").
+        Int("password_length", len(password)).
+        Str("text_preview", truncate(text, 200)).
+        Msg("preparing to upload text to S3")
+
     if err := s3Client.UploadFile(ctx, key, data, password, metadata); err != nil {
         return "", fmt.Errorf("failed to upload to S3: %w", err)
     }
@@ -96,5 +108,13 @@ func SaveAggregatedTextToS3(ctx context.Context, originalRef, jobID, text, passw
     log.Info().Str("s3_url", s3URL).Int("size", len(text)).Msg("uploaded encrypted text result to S3 with Ghost Server metadata")
 
     return s3URL, nil
+}
+
+// truncate returns first n chars of string with ellipsis if truncated
+func truncate(s string, n int) string {
+    if len(s) <= n {
+        return s
+    }
+    return s[:n] + "..."
 }
 

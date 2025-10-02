@@ -38,6 +38,21 @@ func (s *PageStore) GetPageText(ctx context.Context, jobID string, page int) (st
     return res, err
 }
 
+// GetPageTextWithSource returns both text and source for a page
+func (s *PageStore) GetPageTextWithSource(ctx context.Context, jobID string, page int) (string, string, error) {
+    key := s.pageKey(jobID, page)
+    res, err := s.client.HGetAll(ctx, key).Result()
+    if err != nil {
+        return "", "", err
+    }
+    if len(res) == 0 {
+        return "", "", nil
+    }
+    text := res["text"]
+    source := res["source"]
+    return text, source, nil
+}
+
 func (s *PageStore) AggregateText(ctx context.Context, jobID string, total int) (string, error) {
     out := ""
     for i := 1; i <= total; i++ {

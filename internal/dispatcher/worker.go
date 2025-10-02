@@ -3,19 +3,19 @@ package dispatcher
 import (
     "context"
     "encoding/json"
-    "errors"
     "fmt"
     "net/http"
     "os"
     "time"
+    "strings"
+    "bytes"
 
     "github.com/local/aidispatcher/internal/ai"
     "github.com/local/aidispatcher/internal/limiter"
     mpkg "github.com/local/aidispatcher/internal/metrics"
     cfgpkg "github.com/local/aidispatcher/internal/config"
+    redis "github.com/redis/go-redis/v9"
     "github.com/rs/zerolog/log"
-    "strings"
-    "bytes"
 )
 
 type Queue interface {
@@ -33,20 +33,39 @@ type Config struct {
 }
 
 type Worker struct {
-    cfg   Config
-    q     Queue
-    stop  chan struct{}
-    conf  cfgpkg.Config
-    openai ai.Client
+    cfg     Config
+    q       Queue
+    stop    chan struct{}
+    conf    cfgpkg.Config
+    openai  ai.Client
     anthropic ai.Client
-    lim   *limiter.Adaptive
+    lim     *limiter.Adaptive
+    breaker *CircuitBreaker
+    redis   *redis.Client
 }
 
 func New(cfg Config, q Queue) *Worker {
     if cfg.Concurrency <= 0 { cfg.Concurrency = 2 }
     conf := cfgpkg.FromEnv()
     lim, _ := limiter.New(limiter.Options{RedisURL: conf.Queue.RedisURL, MaxInflight: conf.Worker.MaxInflightPerModel, BaseBackoff: conf.Worker.BreakerBaseBackoff, MaxBackoff: conf.Worker.BreakerMaxBackoff})
-    return &Worker{cfg: cfg, q: q, stop: make(chan struct{}), conf: conf, openai: ai.NewOpenAIClient(), anthropic: ai.NewAnthropicClient(), lim: lim}
+
+    // Initialize Redis client for circuit breaker
+    opt, _ := redis.ParseURL(conf.Queue.RedisURL)
+    redisClient := redis.NewClient(opt)
+
+    breaker := NewCircuitBreaker(redisClient, conf.Worker.BreakerBaseBackoff, conf.Worker.BreakerMaxBackoff)
+
+    return &Worker{
+        cfg:       cfg,
+        q:         q,
+        stop:      make(chan struct{}),
+        conf:      conf,
+        openai:    ai.NewOpenAIClient(),
+        anthropic: ai.NewAnthropicClient(),
+        lim:       lim,
+        breaker:   breaker,
+        redis:     redisClient,
+    }
 }
 
 func (w *Worker) Start() {
@@ -92,9 +111,22 @@ func (w *Worker) loop(id int) {
         }
         contentRef, _ := payload["content_ref"].(string)
         preferEngine, _ := payload["ai_engine"].(string)
-        forceFast := boolFromAny(payload["force_fast"]) 
+        forceFast := boolFromAny(payload["force_fast"])
 
-        overallCtx, cancelOverall := context.WithTimeout(context.Background(), w.conf.Worker.PageTotalTimeout)
+        // Extract vision fields from payload
+        imageB64, _ := payload["image_b64"].(string)
+        imageMIME, _ := payload["image_mime"].(string)
+        systemPrompt, _ := payload["system_prompt"].(string)
+        contextText, _ := payload["context_text"].(string)
+        mupdfText, _ := payload["mupdf_text"].(string)
+
+        // Use default system prompt if not provided
+        if systemPrompt == "" {
+            systemPrompt = w.conf.SystemPrompt.DefaultPrompt
+        }
+
+        // Use REQUEST_TIMEOUT from new Timeouts config (default 120s)
+        overallCtx, cancelOverall := context.WithTimeout(context.Background(), w.conf.Timeouts.RequestTimeout)
 
         attempt := intFromAny(payload["attempt"])
         if attempt <= 0 { attempt = 1 }
@@ -110,7 +142,7 @@ func (w *Worker) loop(id int) {
             continue
         }
 
-        ok, provider, model, text, perr := w.processPage(overallCtx, jobID, pageID, contentRef, preferEngine, forceFast)
+        ok, provider, model, text, perr := w.processPageWithFailover(overallCtx, jobID, pageID, contentRef, preferEngine, forceFast, imageB64, imageMIME, systemPrompt, contextText, mupdfText)
         source, _ := payload["source"].(string)
         if source == "" { source = "api" }
         if ok {
@@ -194,192 +226,3 @@ func backoffDelay(base time.Duration, factor float64, attempt int) time.Duration
     return time.Duration(d)
 }
 
-func (w *Worker) processPage(ctx context.Context, jobID string, pageID int, contentRef, preferEngine string, forceFast bool) (bool, string, string, string, error) {
-    // Determine providers and models from config
-    primaryProv := w.conf.Providers.PrimaryEngine
-    secondaryProv := w.conf.Providers.SecondaryEngine
-    if preferEngine != "" { primaryProv = strings.ToLower(preferEngine) }
-
-    // Helper to call provider/model with per-request timeout + metrics
-    call := func(provider, model string) (ai.Response, error) {
-        timeout := w.conf.Worker.RequestTimeout
-        if provider == "openai" { timeout = w.conf.Worker.OpenAITimeout }
-        if provider == "anthropic" { timeout = w.conf.Worker.AnthropicTimeout }
-        if timeout <= 0 { timeout = w.conf.Worker.RequestTimeout }
-
-        req := ai.Request{JobID: jobID, PageID: pageID, ContentRef: contentRef, Model: model, Timeout: timeout}
-        cctx, cancel := context.WithTimeout(ctx, timeout)
-        defer cancel()
-        var client ai.Client
-        switch provider {
-        case "openai": client = w.openai
-        case "anthropic": client = w.anthropic
-        default: client = w.openai
-        }
-        start := time.Now()
-        resp, err := client.Do(cctx, req)
-        dur := time.Since(start)
-        if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-            mpkg.ObserveProvider(provider, model, "timeout", dur)
-            log.Warn().Str("job_id", jobID).Int("page_id", pageID).Str("provider", provider).Str("model", model).
-                Dur("duration", dur).Msg("provider timeout")
-            return ai.Response{}, context.DeadlineExceeded
-        }
-        // classify
-        result := "success"
-        if err != nil {
-            if ai.IsRateLimited(err) { result = "rate_limited" } else if isTransient(err) { result = "transient" } else { result = "fatal" }
-        }
-        mpkg.ObserveProvider(provider, model, result, dur)
-        if err != nil {
-            log.Warn().Str("job_id", jobID).Int("page_id", pageID).Str("provider", provider).Str("model", model).
-                Dur("duration", dur).Err(err).Msg("provider call failed")
-        } else {
-            log.Debug().Str("job_id", jobID).Int("page_id", pageID).Str("provider", provider).Str("model", model).
-                Dur("duration", dur).Int("tokens_in", resp.TokensIn).Int("tokens_out", resp.TokensOut).Msg("provider call success")
-        }
-        return resp, err
-    }
-
-    // Fast-path: only fast models if requested
-    var lastErr error
-    if forceFast {
-        fModel := w.fastModel(primaryProv)
-        if fModel != "" && !w.lim.IsOpen(ctx, primaryProv, fModel) {
-            relF, okF := w.lim.Allow(primaryProv, fModel)
-            if okF {
-                if resp, err := call(primaryProv, fModel); err == nil {
-                    relF(); w.lim.Close(ctx, primaryProv, fModel); return true, primaryProv, fModel, resp.Text, nil
-                }
-                relF()
-            }
-        }
-        sfModel := w.fastModel(secondaryProv)
-        if sfModel != "" && !w.lim.IsOpen(ctx, secondaryProv, sfModel) {
-            relSF, okSF := w.lim.Allow(secondaryProv, sfModel)
-            if okSF {
-                if resp2, err2 := call(secondaryProv, sfModel); err2 == nil {
-                    relSF(); w.lim.Close(ctx, secondaryProv, sfModel); return true, secondaryProv, sfModel, resp2.Text, nil
-                } else {
-                    lastErr = err2
-                }
-                relSF()
-            }
-        }
-        if lastErr == nil { lastErr = fmt.Errorf("fast models unavailable for job %s page %d", jobID, pageID) }
-        return false, "", "", "", lastErr
-    }
-
-    // Try primary provider primary model
-    var err error
-    var resp ai.Response
-    pModel := w.primaryModel(primaryProv)
-    sModel := w.secondaryModel(primaryProv)
-
-    if !w.lim.IsOpen(ctx, primaryProv, pModel) {
-        rel, ok := w.lim.Allow(primaryProv, pModel)
-        if ok {
-            resp, err = call(primaryProv, pModel)
-            rel()
-            if err == nil { w.lim.Close(ctx, primaryProv, pModel); mpkg.BreakerClosed(primaryProv, pModel); return true, primaryProv, pModel, resp.Text, nil }
-            lastErr = err
-            if ai.IsRateLimited(err) || isTransient(err) {
-                w.lim.Open(ctx, primaryProv, pModel)
-                mpkg.BreakerOpened(primaryProv, pModel)
-                log.Warn().Str("job_id", jobID).Int("page_id", pageID).Str("provider", primaryProv).
-                    Str("model", pModel).Err(err).Msg("primary model hit limiter; opening circuit")
-            }
-        }
-    }
-
-    // On 429 or transient → try secondary model of same provider
-    if (ai.IsRateLimited(err) || isTransient(err)) && sModel != "" {
-        if !w.lim.IsOpen(ctx, primaryProv, sModel) {
-            rel2, ok2 := w.lim.Allow(primaryProv, sModel)
-            if ok2 {
-                if resp2, err2 := call(primaryProv, sModel); err2 == nil {
-                    rel2(); w.lim.Close(ctx, primaryProv, sModel); mpkg.BreakerClosed(primaryProv, sModel); return true, primaryProv, sModel, resp2.Text, nil
-                } else {
-                    lastErr = err2
-                }
-                rel2()
-            }
-        }
-    }
-
-    // Try secondary provider primary model (and its secondary on transient/429)
-    spModel := w.primaryModel(secondaryProv)
-    if !w.lim.IsOpen(ctx, secondaryProv, spModel) {
-        rel3, ok3 := w.lim.Allow(secondaryProv, spModel)
-        if ok3 {
-            if resp3, err2 := call(secondaryProv, spModel); err2 == nil {
-                rel3(); w.lim.Close(ctx, secondaryProv, spModel); mpkg.BreakerClosed(secondaryProv, spModel); return true, secondaryProv, spModel, resp3.Text, nil
-            } else {
-                lastErr = err2
-            }
-            rel3()
-            if ai.IsRateLimited(err) || isTransient(err) {
-                ssModel := w.secondaryModel(secondaryProv)
-                if ssModel != "" && !w.lim.IsOpen(ctx, secondaryProv, ssModel) {
-                    rel4, ok4 := w.lim.Allow(secondaryProv, ssModel)
-                    if ok4 {
-                        if resp4, err4 := call(secondaryProv, ssModel); err4 == nil {
-                            rel4(); w.lim.Close(ctx, secondaryProv, ssModel); mpkg.BreakerClosed(secondaryProv, ssModel); return true, secondaryProv, ssModel, resp4.Text, nil
-                        } else {
-                            lastErr = err4
-                        }
-                        rel4()
-                    }
-                }
-            }
-        }
-    }
-    if lastErr == nil { lastErr = err }
-    if lastErr == nil { lastErr = fmt.Errorf("no provider succeeded for job %s page %d", jobID, pageID) }
-    return false, "", "", "", lastErr
-}
-
-func (w *Worker) primaryModel(provider string) string {
-    switch provider {
-    case "openai": return w.conf.Providers.OpenAI.Primary
-    case "anthropic": return w.conf.Providers.Anthropic.Primary
-    default: return w.conf.Providers.OpenAI.Primary
-    }
-}
-
-func (w *Worker) secondaryModel(provider string) string {
-    switch provider {
-    case "openai": return w.conf.Providers.OpenAI.Secondary
-    case "anthropic": return w.conf.Providers.Anthropic.Secondary
-    default: return ""
-    }
-}
-
-func (w *Worker) fastModel(provider string) string {
-    switch provider {
-    case "openai": return w.conf.Providers.OpenAI.Fast
-    case "anthropic": return w.conf.Providers.Anthropic.Fast
-    default: return ""
-    }
-}
-
-// isTransient: timeouts and 5xx treated as transient; 4xx (except 429) as fatal.
-func isTransient(err error) bool {
-    if err == nil { return false }
-    if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) { return true }
-    es := err.Error()
-    // quick parse of status code from provider error strings
-    if strings.Contains(es, "status ") {
-        // treat any 5xx as transient
-        for code := 500; code <= 599; code++ {
-            if strings.Contains(es, fmt.Sprintf("%d", code)) { return true }
-        }
-        // treat 4xx (except 429) as fatal
-        for code := 400; code <= 499; code++ {
-            if code == 429 { continue }
-            if strings.Contains(es, fmt.Sprintf("%d", code)) { return false }
-        }
-    }
-    // default safe side: transient
-    return true
-}

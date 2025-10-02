@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -51,6 +52,7 @@ func (o *Orchestrator) ProcessJobForAI(ctx context.Context, jobID, filePath, use
 		Metadata: map[string]any{
 			"file_path": filePath,
 			"user":      user,
+			"password":  password,
 			"source":    "api",
 		},
 	})
@@ -72,6 +74,7 @@ func (o *Orchestrator) ProcessJobForAI(ctx context.Context, jobID, filePath, use
 		Metadata: map[string]any{
 			"file_path":  filePath,
 			"user":       user,
+			"password":   password,
 			"source":     "api",
 			"local_path": pdfPath,
 		},
@@ -83,6 +86,24 @@ func (o *Orchestrator) ProcessJobForAI(ctx context.Context, jobID, filePath, use
 		return fmt.Errorf("failed to extract page texts: %w", err)
 	}
 
+	// PRE-STORAGE: Store MuPDF text in Redis for all pages (for fallback on AI failure/timeout)
+	for pageNum, text := range pageTexts {
+		key := fmt.Sprintf("job:%s:mupdf:%d", jobID, pageNum)
+		err := o.deps.Redis.Set(ctx, key, text, 24*time.Hour).Err()
+		if err != nil {
+			log.Warn().
+				Err(err).
+				Str("job_id", jobID).
+				Int("page", pageNum).
+				Msg("failed to pre-store MuPDF text")
+		}
+	}
+
+	log.Info().
+		Str("job_id", jobID).
+		Int("pages", len(pageTexts)).
+		Msg("pre-stored MuPDF text for all pages in Redis")
+
 	_ = o.deps.Status.Set(ctx, jobID, Status{
 		Status:   "processing",
 		Progress: 25,
@@ -91,6 +112,7 @@ func (o *Orchestrator) ProcessJobForAI(ctx context.Context, jobID, filePath, use
 		Metadata: map[string]any{
 			"file_path":  filePath,
 			"user":       user,
+			"password":   password,
 			"source":     "api",
 			"local_path": pdfPath,
 			"page_count": len(pageTexts),
@@ -111,6 +133,7 @@ func (o *Orchestrator) ProcessJobForAI(ctx context.Context, jobID, filePath, use
 		Metadata: map[string]any{
 			"file_path":         filePath,
 			"user":              user,
+			"password":          password,
 			"source":            "api",
 			"local_path":        pdfPath,
 			"page_count":        len(classifications),
@@ -133,6 +156,7 @@ func (o *Orchestrator) ProcessJobForAI(ctx context.Context, jobID, filePath, use
 		Metadata: map[string]any{
 			"file_path":         filePath,
 			"user":              user,
+			"password":          password,
 			"source":            "api",
 			"local_path":        pdfPath,
 			"page_count":        len(classifications),
@@ -142,36 +166,85 @@ func (o *Orchestrator) ProcessJobForAI(ctx context.Context, jobID, filePath, use
 		},
 	})
 
-	// Step 5: HERE WE WOULD NORMALLY SEND TO AI - but for dev purposes, we just complete
+	// Step 5: Enqueue AI payloads to Redis queue
+	totalPages := len(classifications)
+	aiPages := len(payloads)
+	textOnlyPages := countByClassification(classifications, "TEXT_ONLY")
+
+	// Enqueue all AI pages with proper worker payload format
+	for _, aiPayload := range payloads {
+		// Create worker-compatible payload
+		workerPayload := map[string]interface{}{
+			"job_id":           jobID,
+			"page_id":          aiPayload.PageNum,
+			"content_ref":      "", // Empty for in-memory processing
+			"ai_engine":        "openai", // Default, can be overridden
+			"force_fast":       false,
+			"attempt":          1,
+			"image_b64":        aiPayload.ImageBase64,
+			"image_mime":       aiPayload.ImageMIME,
+			"width_px":         aiPayload.WidthPx,
+			"height_px":        aiPayload.HeightPx,
+			"mupdf_text":       aiPayload.MuPDFText,
+			"context_text":     aiPayload.ContextText,
+			"system_prompt":    o.cfg.SystemPrompt.DefaultPrompt,
+			"classification":   aiPayload.Classification,
+			"idempotency_key":  fmt.Sprintf("%s:page:%d", jobID, aiPayload.PageNum),
+			"user":             user,
+			"source":           "api",
+		}
+
+		payloadJSON, err := json.Marshal(workerPayload)
+		if err != nil {
+			log.Error().Err(err).Str("job_id", jobID).Int("page", aiPayload.PageNum).Msg("failed to marshal worker payload")
+			continue
+		}
+
+		if err := o.deps.Queue.EnqueueAI(ctx, payloadJSON); err != nil {
+			log.Error().Err(err).Str("job_id", jobID).Int("page", aiPayload.PageNum).Msg("failed to enqueue AI payload")
+			continue
+		}
+	}
+
 	log.Info().
 		Str("job_id", jobID).
-		Int("payloads", len(payloads)).
-		Msg("AI payloads ready - NOT sending to workers (dev mode)")
+		Int("ai_pages", aiPages).
+		Int("text_only_pages", textOnlyPages).
+		Msg("AI pages enqueued to Redis queue")
 
-	// Mark as completed
-	endTime := time.Now()
+	// Update status with AI page tracking
 	_ = o.deps.Status.Set(ctx, jobID, Status{
-		Status:   "success",
-		Progress: 100,
-		Message:  "Processing completed (dev mode - no AI)",
+		Status:   "processing",
+		Progress: 60,
+		Message:  fmt.Sprintf("Enqueued %d AI pages for processing", aiPages),
 		Start:    &startTime,
-		End:      &endTime,
 		Metadata: map[string]any{
-			"file_path":         filePath,
-			"user":              user,
-			"source":            "api",
-			"page_count":        len(classifications),
-			"text_only_pages":   countByClassification(classifications, "TEXT_ONLY"),
-			"graphics_pages":    countByClassification(classifications, "HAS_GRAPHICS"),
-			"payloads_prepared": len(payloads),
-			"duration_seconds":  time.Since(startTime).Seconds(),
+			"file_path":       filePath,
+			"user":            user,
+			"password":        password,
+			"source":          "api",
+			"local_path":      pdfPath,
+			"total_pages":     totalPages,
+			"ai_pages":        aiPages,
+			"text_only_pages": textOnlyPages,
+			"pages_done":      0,
+			"pages_failed":    0,
 		},
 	})
+
+	// Step 6: Start job monitor with timeout (JOB_TIMEOUT default: 5m)
+	go func() {
+		monitorCtx, monitorCancel := context.WithTimeout(context.Background(), o.cfg.Timeouts.JobTimeout)
+		defer monitorCancel()
+		o.monitorJobCompletion(monitorCtx, jobID, totalPages, aiPages)
+	}()
 
 	log.Info().
 		Str("job_id", jobID).
 		Dur("duration", time.Since(startTime)).
-		Msg("AI pipeline processing completed successfully (dev mode)")
+		Int("ai_pages", aiPages).
+		Int("total_pages", totalPages).
+		Msg("AI pipeline setup completed - monitor started")
 
 	return nil
 }

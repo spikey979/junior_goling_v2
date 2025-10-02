@@ -317,11 +317,30 @@ func (s *S3Client) UploadFile(ctx context.Context, key string, data []byte, pass
 		encryptionFormat = metadata.EncryptionFormat
 	}
 
+	// DEBUG: Log before encryption
+	preview := string(data)
+	if len(preview) > 200 {
+		preview = preview[:200] + "..."
+	}
+	log.Debug().
+		Str("key", key).
+		Int("data_length", len(data)).
+		Str("data_preview", preview).
+		Bool("has_password", password != "").
+		Msg("UploadFile: before encryption")
+
 	// Encrypt the data
 	encryptedData, err := s.encryptLegacyCBC(data, password)
 	if err != nil {
+		log.Error().Err(err).Str("key", key).Msg("UploadFile: encryption failed")
 		return fmt.Errorf("failed to encrypt data: %w", err)
 	}
+
+	log.Debug().
+		Str("key", key).
+		Int("plaintext_length", len(data)).
+		Int("encrypted_length", len(encryptedData)).
+		Msg("UploadFile: after encryption")
 
 	// Prepare S3 metadata
 	s3Metadata := make(map[string]string)
@@ -338,7 +357,13 @@ func (s *S3Client) UploadFile(ctx context.Context, key string, data []byte, pass
 	}
 
 	// Upload to S3
-	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
+	log.Debug().
+		Str("key", key).
+		Int("encrypted_size", len(encryptedData)).
+		Interface("metadata", s3Metadata).
+		Msg("UploadFile: calling PutObject")
+
+	output, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:   &s.bucketName,
 		Key:      &key,
 		Body:     bytes.NewReader(encryptedData),
@@ -346,8 +371,14 @@ func (s *S3Client) UploadFile(ctx context.Context, key string, data []byte, pass
 	})
 
 	if err != nil {
+		log.Error().Err(err).Str("key", key).Msg("UploadFile: PutObject failed")
 		return fmt.Errorf("failed to upload to S3: %w", err)
 	}
+
+	log.Debug().
+		Str("key", key).
+		Str("etag", *output.ETag).
+		Msg("UploadFile: PutObject successful")
 
 	log.Info().Str("key", key).Str("encryption", encryptionFormat).Msg("uploaded encrypted file to S3")
 	return nil

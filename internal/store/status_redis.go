@@ -75,6 +75,9 @@ func (s *RedisStatus) Get(ctx context.Context, jobID string) (Status, bool, erro
 
 func (s *RedisStatus) Close() error { return s.client.Close() }
 
+// Client returns the underlying Redis client
+func (s *RedisStatus) Client() *redis.Client { return s.client }
+
 // SetFileJobMapping creates a mapping from file_id to job_id
 func (s *RedisStatus) SetFileJobMapping(ctx context.Context, fileID, jobID string) error {
     key := fmt.Sprintf("file_to_job:%s", fileID)
