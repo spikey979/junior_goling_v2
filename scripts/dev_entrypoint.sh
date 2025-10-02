@@ -4,7 +4,7 @@ set -euo pipefail
 # Simple dev entrypoint that watches for changes in templates and .env,
 # (re)loads environment from /app/.env, and restarts the binary.
 
-APP_BIN="/app/bin/aidispatcher"
+APP_BIN="/app/bin/fileapi"
 ENV_FILE="/app/.env"
 WATCH_DIR="/app/web"
 

@@ -109,7 +109,7 @@ func FromEnv() Config {
     cfg.Logging = LoggingConfig{
         Level:      getEnv("LOG_LEVEL", "info"),
         Pretty:     parseBool(getEnv("LOG_PRETTY", devDefaultPretty())),
-        File:       getEnv("LOG_FILE", "logs/aidispathcher.log"),
+        File:       getEnv("LOG_FILE", "logs/fileapi.log"),
         MaxSizeMB:  parseInt(getEnv("LOG_MAX_SIZE_MB", "100"), 100),
         MaxBackups: parseInt(getEnv("LOG_MAX_BACKUPS", "10"), 10),
         MaxAgeDays: parseInt(getEnv("LOG_MAX_AGE_DAYS", "30"), 30),

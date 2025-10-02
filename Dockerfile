@@ -17,7 +17,7 @@ COPY . .
 
 # Build with CGO (cache build artifacts)
 RUN --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=1 GOOS=linux GOARCH=amd64 GOFLAGS=-mod=mod go build -o /app/bin/aidispatcher ./cmd/app
+    CGO_ENABLED=1 GOOS=linux GOARCH=amd64 GOFLAGS=-mod=mod go build -o /app/bin/fileapi ./cmd/app
 
 FROM debian:bookworm-slim
 WORKDIR /app

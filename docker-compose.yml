@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: aidispatcher
+    container_name: fileapi
     # .env will be mounted as a file for hot-reload
     environment:
       - TZ=Europe/Sarajevo

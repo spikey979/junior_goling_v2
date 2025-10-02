@@ -35,8 +35,8 @@ docker compose exec -T builder bash -lc '
   git config --global --add safe.directory /app;
   export CGO_ENABLED=1 GOOS=linux GOARCH=amd64 GOFLAGS=-mod=mod;
   GO_BIN=${GO_BIN:-/usr/local/go/bin/go};
-  "$GO_BIN" build -v -o bin/aidispatcher ./cmd/app;
-  ls -lh bin/aidispatcher;
+  "$GO_BIN" build -v -o bin/fileapi ./cmd/app;
+  ls -lh bin/fileapi;
 '
 
 echo "[rebuild] Restarting app to pick up new binary..."
