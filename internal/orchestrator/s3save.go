@@ -86,13 +86,13 @@ func SaveAggregatedTextToS3(ctx context.Context, originalRef, jobID, text, passw
     metadata.Metadata["created"] = time.Now().UTC().Format(time.RFC3339)
     metadata.Metadata["body_tokens"] = fmt.Sprintf("%d", len(text)/4)
 
-    // Upload encrypted file to S3
+    // Upload encrypted file to S3 (with optional versioning)
     data := []byte(text)
 
     // DEBUG: Log what we're about to save
     log.Debug().
         Str("job_id", jobID).
-        Str("key", key).
+        Str("base_key", key).
         Int("text_length", len(text)).
         Int("data_length", len(data)).
         Bool("has_password", password != "").
@@ -100,13 +100,47 @@ func SaveAggregatedTextToS3(ctx context.Context, originalRef, jobID, text, passw
         Str("text_preview", truncate(text, 200)).
         Msg("preparing to upload text to S3")
 
+    versioningEnabled := strings.ToLower(os.Getenv("RESULT_VERSIONING_ENABLED")) == "true"
+    if versioningEnabled {
+        // Compute next version key
+        n, err := s3Client.ListNextVersion(ctx, key)
+        if err != nil { log.Warn().Err(err).Str("base_key", key).Msg("failed to list next version; defaulting to v1") }
+        if n <= 0 { n = 1 }
+        versionedKey := fmt.Sprintf("%s_v%d", key, n)
+
+        // Upload to versioned key
+        if err := s3Client.UploadFile(ctx, versionedKey, data, password, metadata); err != nil {
+            return "", fmt.Errorf("failed to upload versioned object to S3: %w", err)
+        }
+
+        // Build base metadata for promotion (REPLACE)
+        baseMeta := map[string]string{
+            "name":               metadata.OriginalName,
+            "content-type":       metadata.ContentType,
+            "encrypted":          "true",
+            "encryption-format":  firstNonEmpty(metadata.EncryptionFormat, "3NCR0PTD"),
+            "pgw_version":        "latest",
+            "source_version":     versionedKey,
+        }
+        for k, v := range metadata.Metadata { baseMeta[k] = v }
+
+        // Promote to base key with replaced metadata
+        if err := s3Client.CopyObjectWithMetadata(ctx, versionedKey, key, baseMeta); err != nil {
+            log.Warn().Err(err).Str("src", versionedKey).Str("dst", key).Msg("promotion to base failed; keeping versioned object only")
+        } else {
+            log.Info().Str("versioned_key", versionedKey).Str("base_key", key).Msg("uploaded versioned object and promoted to base")
+        }
+
+        s3URL := fmt.Sprintf("s3://%s/%s", bucket, key)
+        return s3URL, nil
+    }
+
+    // Legacy behavior: upload directly to base key
     if err := s3Client.UploadFile(ctx, key, data, password, metadata); err != nil {
         return "", fmt.Errorf("failed to upload to S3: %w", err)
     }
-
     s3URL := fmt.Sprintf("s3://%s/%s", bucket, key)
-    log.Info().Str("s3_url", s3URL).Int("size", len(text)).Msg("uploaded encrypted text result to S3 with Ghost Server metadata")
-
+    log.Info().Str("s3_url", s3URL).Int("size", len(text)).Msg("uploaded encrypted text result to S3 with Ghost Server metadata (no versioning)")
     return s3URL, nil
 }
 
@@ -118,3 +152,10 @@ func truncate(s string, n int) string {
     return s[:n] + "..."
 }
 
+// firstNonEmpty returns first non-empty string among args, or empty string if none
+func firstNonEmpty(values ...string) string {
+    for _, v := range values {
+        if strings.TrimSpace(v) != "" { return v }
+    }
+    return ""
+}

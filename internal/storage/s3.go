@@ -10,11 +10,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/crypto/pbkdf2"
 )
@@ -382,6 +384,62 @@ func (s *S3Client) UploadFile(ctx context.Context, key string, data []byte, pass
 
 	log.Info().Str("key", key).Str("encryption", encryptionFormat).Msg("uploaded encrypted file to S3")
 	return nil
+}
+
+// ListNextVersion returns the next available integer suffix for a base key using pattern baseKey_v{N}
+func (s *S3Client) ListNextVersion(ctx context.Context, baseKey string) (int, error) {
+    if baseKey == "" {
+        return 1, nil
+    }
+
+    prefix := baseKey + "_v"
+    maxVersion := 0
+
+    paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+        Bucket: aws.String(s.bucketName),
+        Prefix: aws.String(prefix),
+    })
+
+    for paginator.HasMorePages() {
+        page, err := paginator.NextPage(ctx)
+        if err != nil {
+            return 1, fmt.Errorf("list versions failed: %w", err)
+        }
+        for _, obj := range page.Contents {
+            if obj.Key == nil { continue }
+            key := *obj.Key
+            if strings.HasPrefix(key, prefix) {
+                verStr := strings.TrimPrefix(key, prefix)
+                if n, err := strconv.Atoi(verStr); err == nil {
+                    if n > maxVersion { maxVersion = n }
+                }
+            }
+        }
+    }
+
+    return maxVersion + 1, nil
+}
+
+// CopyObjectWithMetadata copies an object to a new key and replaces metadata
+func (s *S3Client) CopyObjectWithMetadata(ctx context.Context, srcKey, dstKey string, meta map[string]string) error {
+    if srcKey == "" || dstKey == "" {
+        return fmt.Errorf("copy: empty src or dst key")
+    }
+
+    copySource := fmt.Sprintf("%s/%s", s.bucketName, srcKey)
+
+    _, err := s.client.CopyObject(ctx, &s3.CopyObjectInput{
+        Bucket:            aws.String(s.bucketName),
+        Key:               aws.String(dstKey),
+        CopySource:        aws.String(copySource),
+        Metadata:          meta,
+        MetadataDirective: s3types.MetadataDirectiveReplace,
+    })
+    if err != nil {
+        return fmt.Errorf("copy object failed: %w", err)
+    }
+    log.Info().Str("src", srcKey).Str("dst", dstKey).Msg("copied object with replaced metadata")
+    return nil
 }
 
 // encryptLegacyCBC encrypts data using FileAPI legacy CBC format for compatibility
