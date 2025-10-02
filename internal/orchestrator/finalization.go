@@ -133,7 +133,7 @@ func (o *Orchestrator) finalizeJobComplete(ctx context.Context, jobID string, to
 	} else {
 		filePath, _ := st.Metadata["file_path"].(string)
 		password, _ := st.Metadata["password"].(string)
-		s3URL, err := SaveAggregatedTextToS3(ctx, filePath, jobID, aggregatedText, password)
+		s3URL, err := SaveAggregatedTextToS3(ctx, o.deps.Queue, filePath, jobID, aggregatedText, password)
 		if err != nil {
 			log.Error().Err(err).Str("job_id", jobID).Msg("failed to save result to S3")
 			st.Status = "failed"
@@ -252,7 +252,7 @@ func (o *Orchestrator) finalizeJobWithPartialResults(ctx context.Context, jobID 
 	} else {
 		filePath, _ := st.Metadata["file_path"].(string)
 		password, _ := st.Metadata["password"].(string)
-		s3URL, _ := SaveAggregatedTextToS3(ctx, filePath, jobID, aggregatedText, password)
+		s3URL, _ := SaveAggregatedTextToS3(ctx, o.deps.Queue, filePath, jobID, aggregatedText, password)
 		st.Metadata["result_s3_url"] = s3URL
 	}
 

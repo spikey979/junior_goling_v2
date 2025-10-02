@@ -36,6 +36,12 @@ func (o *Orchestrator) monitorJobCompletion(ctx context.Context, jobID string, t
 			return
 
 		case <-ticker.C:
+			// Check if job was cancelled in Redis (primary check)
+			if cancelled, _ := o.deps.Queue.IsCancelled(context.Background(), jobID); cancelled {
+				log.Info().Str("job_id", jobID).Msg("job cancelled (detected via Redis) - stopping monitor")
+				return
+			}
+
 			// Check if all pages are processed
 			st, ok, err := o.deps.Status.Get(context.Background(), jobID)
 			if !ok || err != nil {
@@ -46,9 +52,9 @@ func (o *Orchestrator) monitorJobCompletion(ctx context.Context, jobID string, t
 				continue
 			}
 
-			// Check if job was cancelled externally
+			// Check if job was cancelled externally (secondary check via status)
 			if st.Status == "cancelled" {
-				log.Info().Str("job_id", jobID).Msg("job cancelled externally - stopping monitor")
+				log.Info().Str("job_id", jobID).Msg("job cancelled (detected via status) - stopping monitor")
 				return
 			}
 

@@ -23,6 +23,7 @@ import (
 type Queue interface {
     EnqueueAI(ctx context.Context, payload []byte) error
     CancelJob(ctx context.Context, jobID string) error
+    IsCancelled(ctx context.Context, jobID string) (bool, error)
 }
 
 type Status struct {
@@ -499,6 +500,19 @@ func (o *Orchestrator) handlePageDone(w http.ResponseWriter, r *http.Request) {
     log.Info().Str("job_id", jobID).Int("page_id", pageNum).Int("pages_done", done).Int("pages_failed", failed).Int("total_pages", total).Str("provider", body.Provider).Str("model", body.Model).Msg("page completed")
     // If all pages accounted, aggregate and mark success
     if total > 0 && done+failed >= total {
+        // Check if job was cancelled before finalizing
+        if cancelled, _ := o.deps.Queue.IsCancelled(r.Context(), jobID); cancelled {
+            log.Warn().Str("job_id", jobID).Msg("job was cancelled; skipping aggregation and S3 upload")
+            st.Status = "cancelled"
+            st.Progress = 0
+            st.Message = "Job cancelled before completion"
+            now := time.Now()
+            st.End = &now
+            _ = o.deps.Status.Set(r.Context(), jobID, st)
+            w.WriteHeader(http.StatusNoContent)
+            return
+        }
+
         agg, _ := o.deps.Pages.AggregateText(r.Context(), jobID, total)
         if st.Metadata == nil { st.Metadata = map[string]any{} }
         st.Metadata["result_text_len"] = len(agg)
@@ -521,12 +535,14 @@ func (o *Orchestrator) handlePageDone(w http.ResponseWriter, r *http.Request) {
                 log.Info().Str("job_id", jobID).Str("result_path", localPath).Msg("aggregated result stored locally")
             }
         } else {
-            // Save to S3 (encrypted)
+            // Save to S3 (encrypted) - with cancelled check
             filePath, _ := st.Metadata["file_path"].(string)
             password, _ := st.Metadata["password"].(string)
-            if s3url, err := SaveAggregatedTextToS3(r.Context(), filePath, jobID, agg, password); err == nil {
+            if s3url, err := SaveAggregatedTextToS3(r.Context(), o.deps.Queue, filePath, jobID, agg, password); err == nil {
                 st.Metadata["result_s3_url"] = s3url
                 log.Info().Str("job_id", jobID).Str("result_s3_url", s3url).Msg("aggregated result stored to S3")
+            } else {
+                log.Error().Err(err).Str("job_id", jobID).Msg("failed to save aggregated result to S3")
             }
         }
         st.Status = "success"
@@ -567,6 +583,19 @@ func (o *Orchestrator) handlePageFailed(w http.ResponseWriter, r *http.Request) 
     log.Warn().Str("job_id", jobID).Int("page_id", pageNum).Int("pages_done", done).Int("pages_failed", failed).Int("total_pages", total).Msg("page failed; MuPDF fallback")
     // If all pages accounted, aggregate and mark success
     if total > 0 && done+failed >= total {
+        // Check if job was cancelled before finalizing
+        if cancelled, _ := o.deps.Queue.IsCancelled(r.Context(), jobID); cancelled {
+            log.Warn().Str("job_id", jobID).Msg("job was cancelled; skipping aggregation and S3 upload")
+            st.Status = "cancelled"
+            st.Progress = 0
+            st.Message = "Job cancelled before completion"
+            now := time.Now()
+            st.End = &now
+            _ = o.deps.Status.Set(r.Context(), jobID, st)
+            w.WriteHeader(http.StatusNoContent)
+            return
+        }
+
         agg, _ := o.deps.Pages.AggregateText(r.Context(), jobID, total)
         st.Metadata["result_text_len"] = len(agg)
         // Save result depending on source
@@ -578,9 +607,11 @@ func (o *Orchestrator) handlePageFailed(w http.ResponseWriter, r *http.Request) 
         } else {
             filePath, _ := st.Metadata["file_path"].(string)
             password, _ := st.Metadata["password"].(string)
-            if s3url, err := SaveAggregatedTextToS3(r.Context(), filePath, jobID, agg, password); err == nil {
+            if s3url, err := SaveAggregatedTextToS3(r.Context(), o.deps.Queue, filePath, jobID, agg, password); err == nil {
                 st.Metadata["result_s3_url"] = s3url
                 log.Info().Str("job_id", jobID).Str("result_s3_url", s3url).Msg("job completed with fallback (S3)")
+            } else {
+                log.Error().Err(err).Str("job_id", jobID).Msg("failed to save aggregated result to S3 (fallback)")
             }
         }
         st.Status = "success"
@@ -601,17 +632,44 @@ func (o *Orchestrator) handleCancelJob(w http.ResponseWriter, r *http.Request) {
     var req cancelReq
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil { http.Error(w, "invalid json", 400); return }
     if req.JobID == "" { http.Error(w, "missing job_id", 400); return }
-    // mark cancelled in queue store
-    if err := o.deps.Queue.CancelJob(r.Context(), req.JobID); err != nil {
-        http.Error(w, "cancel failed", 500); return
+
+    // Check if job exists first
+    st, ok, err := o.deps.Status.Get(r.Context(), req.JobID)
+    if err != nil {
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusInternalServerError)
+        _ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "failed to check job status"})
+        return
     }
-    st, ok, _ := o.deps.Status.Get(r.Context(), req.JobID)
-    if !ok { st = Status{} }
+
+    // If job doesn't exist or is already completed, return job_not_found
+    if !ok || st.Status == "success" || st.Status == "cancelled" {
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusNotFound)
+        _ = json.NewEncoder(w).Encode(map[string]any{"job_not_found": true, "job_id": req.JobID})
+        log.Warn().Str("job_id", req.JobID).Bool("exists", ok).Str("status", st.Status).Msg("cancel requested for non-existent or completed job")
+        return
+    }
+
+    // Mark cancelled in queue store
+    if err := o.deps.Queue.CancelJob(r.Context(), req.JobID); err != nil {
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusInternalServerError)
+        _ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "failed to cancel job in queue"})
+        return
+    }
+
+    // Update status to cancelled
     st.Status = "cancelled"
     st.Progress = 0
     if req.Reason != "" { st.Message = fmt.Sprintf("Cancelled: %s", req.Reason) } else { st.Message = "Cancelled" }
-    now := time.Now(); st.End = &now
+    now := time.Now()
+    st.End = &now
     _ = o.deps.Status.Set(r.Context(), req.JobID, st)
+
+    log.Info().Str("job_id", req.JobID).Str("reason", req.Reason).Msg("job cancelled successfully")
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusOK)
     _ = json.NewEncoder(w).Encode(map[string]any{"success": true, "job_id": req.JobID, "status": "cancelled"})
 }
 
@@ -1078,7 +1136,7 @@ func (o *Orchestrator) processMuPDFOnlyFromS3(ctx context.Context, jobID, s3Path
     })
 
     // Save result to S3 (encrypted)
-    s3url, err := SaveAggregatedTextToS3(ctx, s3Path, jobID, resultText, password)
+    s3url, err := SaveAggregatedTextToS3(ctx, o.deps.Queue, s3Path, jobID, resultText, password)
     if err != nil {
         log.Error().Err(err).Str("job_id", jobID).Msg("Failed to save result to S3")
         endTime := time.Now()

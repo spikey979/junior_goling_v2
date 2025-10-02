@@ -11,11 +11,24 @@ import (
     "github.com/rs/zerolog/log"
 )
 
+// QueueChecker interface for checking if a job is cancelled
+type QueueChecker interface {
+    IsCancelled(ctx context.Context, jobID string) (bool, error)
+}
+
 // SaveAggregatedTextToS3 uploads the aggregated text to S3 (encrypted) and returns the s3:// URL.
 // It derives the output location as: results/{jobID}/extracted_text.txt in the same bucket.
 // NOTE: File is encrypted using the same password used to download the original file.
 // NOTE: Preserves original metadata from source file for Ghost Server compatibility.
-func SaveAggregatedTextToS3(ctx context.Context, originalRef, jobID, text, password string) (string, error) {
+// NOTE: Checks if job is cancelled before uploading to prevent uploading cancelled jobs.
+func SaveAggregatedTextToS3(ctx context.Context, queue QueueChecker, originalRef, jobID, text, password string) (string, error) {
+    // Check if job was cancelled before uploading to S3
+    if queue != nil {
+        if cancelled, err := queue.IsCancelled(ctx, jobID); err == nil && cancelled {
+            log.Warn().Str("job_id", jobID).Msg("job is cancelled; aborting S3 upload")
+            return "", fmt.Errorf("job %s was cancelled; S3 upload aborted", jobID)
+        }
+    }
     bucket := os.Getenv("AWS_S3_BUCKET")
     if bucket == "" {
         bucket = "junior-files-dev" // default bucket
