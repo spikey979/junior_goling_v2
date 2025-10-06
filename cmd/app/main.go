@@ -9,6 +9,7 @@ import (
     "syscall"
     "time"
 
+    "github.com/joho/godotenv"
     "github.com/rs/zerolog/log"
 
     cfgpkg "github.com/local/aidispatcher/internal/config"
@@ -25,6 +26,9 @@ import (
 )
 
 func main() {
+    // Load .env file if it exists
+    _ = godotenv.Load()
+
     cfg := cfgpkg.FromEnv()
 
     // Init logging

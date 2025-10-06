@@ -239,10 +239,11 @@ func (o *Orchestrator) ProcessJobForAI(ctx context.Context, jobID, filePath, use
 	})
 
 	// Step 6: Start job monitor with timeout (JOB_TIMEOUT default: 5m)
+	aiStartTime := time.Now() // Track when AI processing starts
 	go func() {
 		monitorCtx, monitorCancel := context.WithTimeout(context.Background(), o.cfg.Timeouts.JobTimeout)
 		defer monitorCancel()
-		o.monitorJobCompletion(monitorCtx, jobID, totalPages, aiPages)
+		o.monitorJobCompletion(monitorCtx, jobID, totalPages, aiPages, aiStartTime)
 	}()
 
 	log.Info().
@@ -613,6 +614,8 @@ func (o *Orchestrator) prepareAIPayloadsForAllPages(ctx context.Context, pdfPath
 			Int("page", pageNum).
 			Int("context_chars", len(contextText)).
 			Int("mupdf_chars", len(mupdfText)).
+			Str("context_preview", truncateText(contextText, 200)).
+			Str("mupdf_preview", truncateText(mupdfText, 100)).
 			Msg("prepared AI payload")
 	}
 
@@ -661,10 +664,8 @@ func prepareContextText(pageTexts map[int]string, pageNum, radius int) string {
 		}
 	}
 
-	// Add current page text
-	if text, ok := pageTexts[pageNum]; ok && text != "" {
-		contextParts = append(contextParts, fmt.Sprintf("=== Page %d (current) ===\n%s", pageNum, text))
-	}
+	// NOTE: We DO NOT include current page text here - it's sent separately as MuPDF text
+	// This is context from OTHER pages only
 
 	// Add text from next pages (within radius)
 	for i := pageNum + 1; i <= pageNum+radius; i++ {

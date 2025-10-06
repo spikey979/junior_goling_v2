@@ -378,14 +378,15 @@ func (o *Orchestrator) handleProcessUpload(w http.ResponseWriter, r *http.Reques
 
     // Start document-level timeout monitor in background
     // Default timeout 3m unless overridden via DOCUMENT_PROCESSING_TIMEOUT
-    go func(jid string, total, aiPagesCount int){
+    aiStartTime := time.Now()
+    go func(jid string, total, aiPagesCount int, startTime time.Time){
         to := os.Getenv("DOCUMENT_PROCESSING_TIMEOUT")
         dur, err := time.ParseDuration(to)
         if err != nil || dur <= 0 { dur = 3 * time.Minute }
         ctx, cancel := context.WithTimeout(context.Background(), dur)
         defer cancel()
-        o.monitorJobCompletion(ctx, jid, total, aiPagesCount)
-    }(jobID, pages, len(sel.AIPages))
+        o.monitorJobCompletion(ctx, jid, total, aiPagesCount, startTime)
+    }(jobID, pages, len(sel.AIPages), aiStartTime)
 
     w.Header().Set("Content-Type", "application/json")
     w.WriteHeader(http.StatusCreated)

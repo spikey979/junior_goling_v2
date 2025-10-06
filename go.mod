@@ -12,6 +12,7 @@ require (
 	github.com/gabriel-vasile/mimetype v1.4.3
 	github.com/gen2brain/go-fitz v1.24.15
 	github.com/google/uuid v1.6.0
+	github.com/joho/godotenv v1.5.1
 	github.com/pdfcpu/pdfcpu v0.6.0
 	github.com/prometheus/client_golang v1.18.0
 	github.com/redis/go-redis/v9 v9.5.1

@@ -65,11 +65,14 @@ func (c *AnthropicClient) Do(ctx context.Context, req Request) (Response, error)
 
     // Build user prompt with context and MuPDF text
     var userPrompt string
+
+    userPrompt = fmt.Sprintf("CURRENT PAGE NUMBER: %d\n\n", req.PageID)
+
     if req.ContextText != "" {
-        userPrompt = fmt.Sprintf("CONTEXT (from surrounding pages):\n%s\n\n", req.ContextText)
+        userPrompt += fmt.Sprintf("CONTEXT (from surrounding pages):\n%s\n\n", req.ContextText)
     }
     if req.MuPDFText != "" {
-        userPrompt += fmt.Sprintf("MUPDF EXTRACTED TEXT:\n%s\n\n", req.MuPDFText)
+        userPrompt += fmt.Sprintf("MUPDF EXTRACTED TEXT (from current page):\n%s\n\n", req.MuPDFText)
     }
     userPrompt += "Please extract and return the complete text from this page following the rules in the system prompt."
 

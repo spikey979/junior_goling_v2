@@ -8,7 +8,7 @@ import (
 )
 
 // monitorJobCompletion monitors job completion and handles timeout
-func (o *Orchestrator) monitorJobCompletion(ctx context.Context, jobID string, totalPages, aiPages int) {
+func (o *Orchestrator) monitorJobCompletion(ctx context.Context, jobID string, totalPages, aiPages int, aiStartTime time.Time) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -72,11 +72,13 @@ func (o *Orchestrator) monitorJobCompletion(ctx context.Context, jobID string, t
 
 			if pagesProcessed >= aiPages {
 				// All AI pages processed - normal completion
+				aiDuration := time.Since(aiStartTime)
 				log.Info().
 					Str("job_id", jobID).
 					Int("ai_pages", aiPages).
 					Int("pages_done", pagesDone).
 					Int("pages_failed", pagesFailed).
+					Float64("ai_total_duration_sec", aiDuration.Seconds()).
 					Msg("all AI pages processed - finalizing job")
 
 				o.finalizeJobComplete(context.Background(), jobID, totalPages)

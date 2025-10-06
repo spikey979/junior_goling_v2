@@ -71,7 +71,9 @@ func (w *Worker) processPageWithFailover(ctx context.Context, jobID string, page
 			MuPDFText:    mupdfText,
 		}
 
-		cctx, cancel := context.WithTimeout(ctx, timeout)
+		// IMPORTANT: Create fresh context for each attempt, not inheriting from parent
+		// This prevents cancelled context from previous attempt affecting this one
+		cctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 
 		var client ai.Client
