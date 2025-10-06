@@ -499,58 +499,17 @@ func (o *Orchestrator) handlePageDone(w http.ResponseWriter, r *http.Request) {
     if total > 0 { st.Progress = int(float64(done+failed) / float64(total) * 100) }
     st.Message = fmt.Sprintf("page %s done", pageIDStr)
     log.Info().Str("job_id", jobID).Int("page_id", pageNum).Int("pages_done", done).Int("pages_failed", failed).Int("total_pages", total).Str("provider", body.Provider).Str("model", body.Model).Msg("page completed")
-    // If all pages accounted, aggregate and mark success
+    // If all pages accounted, update status but DON'T finalize yet
+    // Let job monitor (finalizeJobComplete) handle final V2 upload and status
     if total > 0 && done+failed >= total {
-        // Check if job was cancelled before finalizing
-        if cancelled, _ := o.deps.Queue.IsCancelled(r.Context(), jobID); cancelled {
-            log.Warn().Str("job_id", jobID).Msg("job was cancelled; skipping aggregation and S3 upload")
-            st.Status = "cancelled"
-            st.Progress = 0
-            st.Message = "Job cancelled before completion"
-            now := time.Now()
-            st.End = &now
-            _ = o.deps.Status.Set(r.Context(), jobID, st)
-            w.WriteHeader(http.StatusNoContent)
-            return
-        }
-
-        agg, _ := o.deps.Pages.AggregateText(r.Context(), jobID, total)
-        if st.Metadata == nil { st.Metadata = map[string]any{} }
-        st.Metadata["result_text_len"] = len(agg)
-
-        // DEBUG: Log aggregated text preview
-        preview := agg
-        if len(agg) > 300 {
-            preview = agg[:300] + "..."
-        }
-        log.Debug().
+        // Just mark that all pages are done - monitor will finalize
+        st.Message = fmt.Sprintf("All %d pages processed - finalizing", total)
+        st.Progress = 95 // Almost done, but not 100% yet
+        log.Info().
             Str("job_id", jobID).
-            Int("agg_length", len(agg)).
-            Str("agg_preview", preview).
-            Msg("handlePageDone aggregated text")
-
-        // Save result depending on source
-        if src, _ := st.Metadata["source"].(string); src == "upload" {
-            if localPath, err := SaveAggregatedTextToLocal(r.Context(), jobID, agg); err == nil {
-                st.Metadata["result_local_path"] = localPath
-                log.Info().Str("job_id", jobID).Str("result_path", localPath).Msg("aggregated result stored locally")
-            }
-        } else {
-            // Save to S3 (encrypted) - with cancelled check
-            filePath, _ := st.Metadata["file_path"].(string)
-            password, _ := st.Metadata["password"].(string)
-            if s3url, err := SaveAggregatedTextToS3(r.Context(), o.deps.Queue, filePath, jobID, agg, password); err == nil {
-                st.Metadata["result_s3_url"] = s3url
-                log.Info().Str("job_id", jobID).Str("result_s3_url", s3url).Msg("aggregated result stored to S3")
-            } else {
-                log.Error().Err(err).Str("job_id", jobID).Msg("failed to save aggregated result to S3")
-            }
-        }
-        st.Status = "success"
-        st.Progress = 100
-        // Cleanup stale temp files older than 1h as part of job completion hygiene
-        CleanupTemps(1 * time.Hour)
-        log.Info().Str("job_id", jobID).Int("pages_done", done).Int("pages_failed", failed).Msg("job completed")
+            Int("pages_done", done).
+            Int("pages_failed", failed).
+            Msg("all pages processed - waiting for monitor to finalize")
     }
     _ = o.deps.Status.Set(r.Context(), jobID, st)
     w.WriteHeader(http.StatusNoContent)
@@ -608,11 +567,16 @@ func (o *Orchestrator) handlePageFailed(w http.ResponseWriter, r *http.Request) 
         } else {
             filePath, _ := st.Metadata["file_path"].(string)
             password, _ := st.Metadata["password"].(string)
-            if s3url, err := SaveAggregatedTextToS3(r.Context(), o.deps.Queue, filePath, jobID, agg, password); err == nil {
+            if s3url, err := uploadAITextAsV2(r.Context(), o.deps.Queue, filePath, jobID, agg, password); err == nil {
                 st.Metadata["result_s3_url"] = s3url
+                st.Metadata["text_v2_url"] = s3url
+                st.Metadata["v2_ready"] = true
+                st.Metadata["v2_s3_key"] = s3url
+                st.Metadata["current_version"] = "2"
                 log.Info().Str("job_id", jobID).Str("result_s3_url", s3url).Msg("job completed with fallback (S3)")
             } else {
                 log.Error().Err(err).Str("job_id", jobID).Msg("failed to save aggregated result to S3 (fallback)")
+                st.Metadata["v2_failed"] = true
             }
         }
         st.Status = "success"

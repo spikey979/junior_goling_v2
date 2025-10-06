@@ -65,6 +65,13 @@ func (o *Orchestrator) ProcessJobForAI(ctx context.Context, jobID, filePath, use
 			"user":      user,
 			"password":  password,
 			"source":    "api",
+			// Ghost Server compatibility fields
+			"v1_ready":       false,
+			"v2_ready":       false,
+			"v1_s3_key":      nil,
+			"v2_s3_key":      nil,
+			"current_version": nil,
+			"v2_failed":      false,
 		},
 	})
 
@@ -147,6 +154,13 @@ func (o *Orchestrator) ProcessJobForAI(ctx context.Context, jobID, filePath, use
 			"page_count":     len(pageTexts),
 			"text_v1_url":    textV1URL,
 			"mupdf_readable": prepResult.MuPDFReadable,
+			// Ghost Server compatibility fields
+			"v1_ready":       textV1URL != "",
+			"v2_ready":       false,
+			"v1_s3_key":      textV1URL,
+			"v2_s3_key":      nil,
+			"current_version": "1",
+			"v2_failed":      false,
 		},
 	})
 
@@ -235,6 +249,13 @@ func (o *Orchestrator) ProcessJobForAI(ctx context.Context, jobID, filePath, use
 			"text_v1_url": textV1URL,
 			"pages_done":  0,
 			"pages_failed": 0,
+			// Ghost Server compatibility - V1 ready, waiting for V2
+			"v1_ready":       textV1URL != "",
+			"v2_ready":       false,
+			"v1_s3_key":      textV1URL,
+			"v2_s3_key":      nil,
+			"current_version": "1",
+			"v2_failed":      false,
 		},
 	})
 

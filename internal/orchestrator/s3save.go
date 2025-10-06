@@ -129,6 +129,12 @@ func uploadMuPDFTextAsV1(ctx context.Context, queue QueueChecker, originalRef, j
 		}
 	}
 
+	log.Debug().
+		Str("v1_key", v1Key).
+		Str("base_key", baseKey).
+		Interface("base_metadata", baseMeta).
+		Msg("promoting v1 to base key with metadata")
+
 	if err := s3Client.CopyObjectWithMetadata(ctx, v1Key, baseKey, baseMeta); err != nil {
 		log.Warn().Err(err).Str("src", v1Key).Str("dst", baseKey).Msg("failed to promote v1 to base key")
 		// Return v1 URL even if promotion fails
@@ -188,22 +194,56 @@ func uploadAITextAsV2(ctx context.Context, queue QueueChecker, originalRef, jobI
 		return "", fmt.Errorf("failed to create S3 client: %w", err)
 	}
 
-	// Prepare metadata for v2 upload
+	// Download original file metadata to preserve Ghost Server fields (same as V1 does)
+	var originalMetadata *storage.FileMetadata
+	if originalKey != "" {
+		_, origMeta, err := s3Client.DownloadFile(ctx, originalKey, password)
+		if err != nil {
+			log.Warn().Err(err).Str("original_key", originalKey).Msg("failed to get original metadata for v2, using defaults")
+		} else {
+			originalMetadata = origMeta
+		}
+	}
+
+	// Prepare metadata for v2 upload (preserve original name)
+	originalName := "extracted_text_v2.txt"
+	if originalMetadata != nil && originalMetadata.OriginalName != "" {
+		originalName = originalMetadata.OriginalName
+	}
+
 	metadata := &storage.FileMetadata{
-		OriginalName: "extracted_text_v2.txt",
+		OriginalName: originalName,
 		ContentType:  "application/json", // Ghost Server expects application/json
 		Size:         int64(len(text)),
-		Metadata: map[string]string{
-			"job_id":  jobID,
-			"version": "2",
-			"source":  "ai_extraction",
-			"format":  "plain_text",
-			"created": time.Now().UTC().Format(time.RFC3339),
-		},
+		Metadata:     make(map[string]string),
 	}
+
+	// Copy ALL metadata from original file first (Ghost Server compatibility)
+	if originalMetadata != nil && originalMetadata.Metadata != nil {
+		for k, v := range originalMetadata.Metadata {
+			metadata.Metadata[k] = v
+		}
+	}
+
+	// Override with v2-specific fields
+	metadata.Metadata["job_id"] = jobID
+	metadata.Metadata["version"] = "2"
+	metadata.Metadata["source"] = "ai_extraction"
+	metadata.Metadata["format"] = "plain_text"
+	metadata.Metadata["created"] = time.Now().UTC().Format(time.RFC3339)
 
 	// Upload to S3 as _v2
 	data := []byte(text)
+
+	// DEBUG: Log metadata before upload
+	log.Debug().
+		Str("job_id", jobID).
+		Str("v2_key", v2Key).
+		Str("source_in_metadata", metadata.Metadata["source"]).
+		Str("version_in_metadata", metadata.Metadata["version"]).
+		Interface("all_metadata", metadata.Metadata).
+		Msg("uploadAITextAsV2: before UploadFile call")
+
 	if err := s3Client.UploadFile(ctx, v2Key, data, password, metadata); err != nil {
 		return "", fmt.Errorf("failed to upload AI v2 to S3: %w", err)
 	}
@@ -216,7 +256,7 @@ func uploadAITextAsV2(ctx context.Context, queue QueueChecker, originalRef, jobI
 
 	// Promote v2 to base key (latest version)
 	baseMeta := map[string]string{
-		"name":              "extracted_text.txt",
+		"name":              metadata.OriginalName,
 		"content-type":      metadata.ContentType,
 		"encrypted":         "true",
 		"encryption-format": "3NCR0PTD",
@@ -227,6 +267,19 @@ func uploadAITextAsV2(ctx context.Context, queue QueueChecker, originalRef, jobI
 		"created":           metadata.Metadata["created"],
 		"promoted_from":     v2Key,
 	}
+
+	// Copy all other metadata from v2 (includes Ghost Server fields from original)
+	for k, v := range metadata.Metadata {
+		if _, exists := baseMeta[k]; !exists {
+			baseMeta[k] = v
+		}
+	}
+
+	log.Debug().
+		Str("v2_key", v2Key).
+		Str("base_key", baseKey).
+		Interface("base_metadata", baseMeta).
+		Msg("promoting v2 to base key with metadata")
 
 	if err := s3Client.CopyObjectWithMetadata(ctx, v2Key, baseKey, baseMeta); err != nil {
 		log.Warn().Err(err).Str("src", v2Key).Str("dst", baseKey).Msg("failed to promote v2 to base key")

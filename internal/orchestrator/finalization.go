@@ -64,7 +64,12 @@ func (o *Orchestrator) aggregateAllPages(ctx context.Context, jobID string, tota
 			builder.WriteString("\n\n")
 		}
 
-		builder.WriteString(fmt.Sprintf("=== Page %d ===\n", i))
+		// Check if pageText already starts with page marker (AI adds it)
+		expectedMarker := fmt.Sprintf("=== Page %d ===", i)
+		if !strings.HasPrefix(strings.TrimSpace(pageText), expectedMarker) {
+			// Add marker only if not already present
+			builder.WriteString(fmt.Sprintf("=== Page %d ===\n", i))
+		}
 		builder.WriteString(pageText)
 
 		sources[i-1] = source
@@ -144,6 +149,10 @@ func (o *Orchestrator) finalizeJobComplete(ctx context.Context, jobID string, to
 		}
 		st.Metadata["result_s3_url"] = s3URL
 		st.Metadata["text_v2_url"] = s3URL // Mark as v2
+		// Ghost Server compatibility fields for V2
+		st.Metadata["v2_ready"] = true
+		st.Metadata["v2_s3_key"] = s3URL
+		st.Metadata["current_version"] = "2"
 	}
 
 	// Update status
