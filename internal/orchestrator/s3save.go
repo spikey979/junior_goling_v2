@@ -102,13 +102,47 @@ func uploadMuPDFTextAsV1(ctx context.Context, queue QueueChecker, originalRef, j
 		return "", fmt.Errorf("failed to upload MuPDF v1 to S3: %w", err)
 	}
 
-	s3URL := fmt.Sprintf("s3://%s/%s", bucket, v1Key)
 	log.Info().
 		Str("job_id", jobID).
-		Str("s3_url", s3URL).
+		Str("v1_key", v1Key).
 		Int("size", len(text)).
 		Msg("uploaded MuPDF text as version 1 to S3")
 
+	// Promote v1 to base key (same as v2 does) for Ghost Server compatibility
+	baseMeta := map[string]string{
+		"name":              metadata.OriginalName,
+		"content-type":      metadata.ContentType,
+		"encrypted":         "true",
+		"encryption-format": "3NCR0PTD",
+		"job_id":            jobID,
+		"version":           "1",
+		"source":            "mupdf_extraction",
+		"format":            "plain_text",
+		"created":           metadata.Metadata["created"],
+		"promoted_from":     v1Key,
+	}
+
+	// Copy all other metadata from v1
+	for k, v := range metadata.Metadata {
+		if _, exists := baseMeta[k]; !exists {
+			baseMeta[k] = v
+		}
+	}
+
+	if err := s3Client.CopyObjectWithMetadata(ctx, v1Key, baseKey, baseMeta); err != nil {
+		log.Warn().Err(err).Str("src", v1Key).Str("dst", baseKey).Msg("failed to promote v1 to base key")
+		// Return v1 URL even if promotion fails
+		return fmt.Sprintf("s3://%s/%s", bucket, v1Key), nil
+	}
+
+	log.Info().
+		Str("job_id", jobID).
+		Str("versioned_key", v1Key).
+		Str("base_key", baseKey).
+		Msg("promoted MuPDF v1 to base key")
+
+	// Return base key URL (promoted as latest)
+	s3URL := fmt.Sprintf("s3://%s/%s", bucket, baseKey)
 	return s3URL, nil
 }
 

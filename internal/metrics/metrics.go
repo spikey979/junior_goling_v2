@@ -108,4 +108,9 @@ func IncProcessedAttr(result, source string, fast bool) {
 
 func IncRetryAttr(source string, fast bool) { retriesAttr.WithLabelValues(source, boolToStr(fast)).Inc() }
 
+// IncRefusal tracks content refusal events by provider and model
+func IncRefusal(provider, model string) {
+    providerReqs.WithLabelValues(provider, model, "content_refused").Inc()
+}
+
 func boolToStr(b bool) string { if b { return "true" }; return "false" }

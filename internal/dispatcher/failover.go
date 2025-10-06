@@ -107,7 +107,9 @@ func (w *Worker) processPageWithFailover(ctx context.Context, jobID string, page
 		// Classify error
 		result := "success"
 		if err != nil {
-			if ai.IsRateLimited(err) {
+			if ai.IsContentRefused(err) {
+				result = "content_refused"
+			} else if ai.IsRateLimited(err) {
 				result = "rate_limited"
 			} else if isTransientError(err) {
 				result = "transient"
@@ -121,15 +123,21 @@ func (w *Worker) processPageWithFailover(ctx context.Context, jobID string, page
 		mpkg.ObserveProvider(provider, model, result, dur)
 
 		if err != nil {
-			log.Warn().
+			logEvent := log.Warn().
 				Str("job_id", jobID).
 				Int("page_id", pageID).
 				Str("provider", provider).
 				Str("model", model).
 				Dur("duration", dur).
 				Str("result", result).
-				Err(err).
-				Msg("AI provider call failed")
+				Err(err)
+
+			// Special logging for content refusal
+			if ai.IsContentRefused(err) {
+				logEvent.Msg("AI model refused to process content - triggering failover")
+			} else {
+				logEvent.Msg("AI provider call failed")
+			}
 		} else {
 			log.Debug().
 				Str("job_id", jobID).

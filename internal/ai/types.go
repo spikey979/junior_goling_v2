@@ -35,8 +35,10 @@ type Client interface {
 }
 
 var (
-    ErrRateLimited = errors.New("rate_limited")
+    ErrRateLimited    = errors.New("rate_limited")
+    ErrContentRefused = errors.New("content_refused")
 )
 
 func IsRateLimited(err error) bool { return errors.Is(err, ErrRateLimited) }
+func IsContentRefused(err error) bool { return errors.Is(err, ErrContentRefused) }
 

@@ -8,6 +8,7 @@ import (
     "fmt"
     "net/http"
     "os"
+    "strings"
 )
 
 type OpenAIClient struct{
@@ -35,8 +36,10 @@ type openAIChatReq struct {
 type openAIChatResp struct {
     Choices []struct {
         Message struct {
-            Content string `json:"content"`
+            Content string  `json:"content"`
+            Refusal *string `json:"refusal"` // Null or string with refusal reason
         } `json:"message"`
+        FinishReason string `json:"finish_reason"` // "stop", "length", "content_filter"
     } `json:"choices"`
     Usage struct {
         PromptTokens     int `json:"prompt_tokens"`
@@ -130,9 +133,55 @@ func (c *OpenAIClient) Do(ctx context.Context, req Request) (Response, error) {
         return Response{}, errors.New("no choices")
     }
 
+    choice := r.Choices[0]
+
+    // REFUSAL DETECTION 1: Check explicit refusal field
+    if choice.Message.Refusal != nil && *choice.Message.Refusal != "" {
+        return Response{}, fmt.Errorf("%w: %s", ErrContentRefused, *choice.Message.Refusal)
+    }
+
+    // REFUSAL DETECTION 2: Check finish_reason for content_filter
+    if choice.FinishReason == "content_filter" {
+        return Response{}, fmt.Errorf("%w: content filtered by safety system", ErrContentRefused)
+    }
+
+    // REFUSAL DETECTION 3: Heuristic - check content for refusal phrases
+    if isRefusalContent(choice.Message.Content) {
+        return Response{}, fmt.Errorf("%w: detected refusal pattern in response", ErrContentRefused)
+    }
+
     return Response{
-        Text:      r.Choices[0].Message.Content,
+        Text:      choice.Message.Content,
         TokensIn:  r.Usage.PromptTokens,
         TokensOut: r.Usage.CompletionTokens,
     }, nil
+}
+
+// isRefusalContent checks if content contains typical refusal phrases
+func isRefusalContent(content string) bool {
+    if len(content) < 10 {
+        return false // Too short to be meaningful refusal
+    }
+
+    refusalPhrases := []string{
+        "i cannot assist",
+        "i'm unable to help",
+        "i cannot provide",
+        "i cannot process",
+        "against my guidelines",
+        "i'm not able to",
+        "i can't help with",
+        "i'm not comfortable",
+        "violates my programming",
+        "i must decline",
+    }
+
+    contentLower := strings.ToLower(content)
+    for _, phrase := range refusalPhrases {
+        if strings.Contains(contentLower, phrase) {
+            return true
+        }
+    }
+
+    return false
 }

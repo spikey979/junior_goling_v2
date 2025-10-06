@@ -8,6 +8,7 @@ import (
     "fmt"
     "net/http"
     "os"
+    "strings"
 )
 
 type AnthropicClient struct{ http *http.Client; apiKey string }
@@ -36,7 +37,9 @@ type anthropicMsgReq struct {
 type anthropicMsgResp struct {
     Content []struct {
         Text string `json:"text"`
+        Type string `json:"type"` // "text" or potentially "refusal" in future
     } `json:"content"`
+    StopReason string `json:"stop_reason"` // "end_turn", "max_tokens", "stop_sequence"
     Usage struct {
         InputTokens  int `json:"input_tokens"`
         OutputTokens int `json:"output_tokens"`
@@ -118,9 +121,52 @@ func (c *AnthropicClient) Do(ctx context.Context, req Request) (Response, error)
         return Response{}, errors.New("no content")
     }
 
+    text := r.Content[0].Text
+
+    // REFUSAL DETECTION 1: Check content type (future-proofing for explicit refusal type)
+    if r.Content[0].Type == "refusal" {
+        return Response{}, fmt.Errorf("%w: %s", ErrContentRefused, text)
+    }
+
+    // REFUSAL DETECTION 2: Heuristic - check for refusal phrases
+    if isAnthropicRefusal(text) {
+        return Response{}, fmt.Errorf("%w: detected refusal pattern in response", ErrContentRefused)
+    }
+
     return Response{
-        Text:      r.Content[0].Text,
+        Text:      text,
         TokensIn:  r.Usage.InputTokens,
         TokensOut: r.Usage.OutputTokens,
     }, nil
+}
+
+// isAnthropicRefusal checks if Anthropic response contains refusal patterns
+func isAnthropicRefusal(content string) bool {
+    if len(content) < 10 {
+        return false
+    }
+
+    refusalPhrases := []string{
+        "i cannot assist",
+        "i'm unable to help",
+        "i cannot provide",
+        "i cannot process",
+        "i'm not able to",
+        "i can't help with",
+        "i'm not comfortable",
+        "i must decline",
+        "i should not",
+        "i will not",
+        "against my values",
+        "not appropriate for me",
+    }
+
+    contentLower := strings.ToLower(content)
+    for _, phrase := range refusalPhrases {
+        if strings.Contains(contentLower, phrase) {
+            return true
+        }
+    }
+
+    return false
 }
